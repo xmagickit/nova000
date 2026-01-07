@@ -171,16 +171,17 @@ def select_diverse_subset(pool, top_95_smiles, subset_size=5, entropy_threshold=
 
 
 def main(config: dict):
-    # ========== OPTIMIZED COMBINED VERSION: Best of v1-v7 ==========
-    # Key improvements:
-    # - From v1: base_n_samples = 1800 (highest, biggest win margin 0.025)
-    # - From v7: Early synthon search (iteration > 1), improved score calc, TOP-1 focus (35%)
-    # - From v6/v7: Dynamic sample size boosting based on improvement rate
-    # - From vs_opponent: 3 CPU workers for parallel exploration
-    # - From v7: 3-strategy CPU similarity search starting earlier (iteration > 1)
-    # - From v7: Periodic entropy checks
-    
-    base_n_samples = 3000  # From v1: Highest base samples (biggest win margin)
+    # V8 COMBINED: Best features from v1-v7 + vs_opponent
+    # - base_n_samples=1800 (from v1/v4/v6/v7) for higher exploration
+    # - max_workers=3 (from vs_opponent) for better parallel processing
+    # - Early synthon search: iteration > 1 (from v5/vs_opponent)
+    # - Dynamic sample size boosting (from v5) - adapts to improvement rate
+    # - Improved score calculation (from v7/vs_opponent) - avg + max weighted
+    # - Periodic entropy checks (from v7) - every 5 iterations
+    # - TOP-1 focused strategy (from v7/vs_opponent) - when scores are very high
+    # - Early CPU search: iteration > 1 (from v5) - 3 strategies
+    # - Better multi-range strategy (from v7/vs_opponent) - TOP-1, TOP-5, medium, broad
+    base_n_samples = 3000  # Higher exploration from v1/v4/v6/v7
     top_pool = pd.DataFrame(columns=["name", "smiles", "InChIKey", "score", "Target", "Anti"])
     rxn_id = int(config["allowed_reaction"].split(":")[-1])
     iteration = 0
@@ -212,10 +213,8 @@ def main(config: dict):
             iteration += 1
             iter_start_time = time.time()
             
-            # ========== DYNAMIC SAMPLE SIZE WITH IMPROVEMENT BOOSTING (from v6/v7) ==========
+            # Adaptive n_samples: maintain good throughput + dynamic boosting (from v5)
             remaining_time = 1800 - (time.time() - start)
-            
-            # Base adaptive sizing
             if remaining_time > 1500:
                 base_adaptive = base_n_samples
             elif remaining_time > 900:
@@ -227,24 +226,24 @@ def main(config: dict):
             else:
                 base_adaptive = int(base_n_samples * 0.80)
             
-            # Boost samples based on improvement rate (from v6/v7)
+            # Dynamic sample size boosting based on improvement rate (from v5)
             if score_improvement_rate > 0.05:
-                n_samples = int(base_adaptive * 1.5)  
-                bt.logging.info(f"[OPTIMIZED] High improvement, BOOSTED samples: {n_samples}")
+                n_samples = int(base_adaptive * 1.5)  # Boost when improving fast
+                bt.logging.info(f"[V8] High improvement, BOOSTED samples: {n_samples}")
             elif score_improvement_rate > 0.02:
                 n_samples = int(base_adaptive * 1.2)
-                bt.logging.info(f"[OPTIMIZED] Good improvement, increased samples: {n_samples}")
+                bt.logging.info(f"[V8] Good improvement, increased samples: {n_samples}")
             else:
                 n_samples = base_adaptive
             
-            # Build synthon library after first iteration
+            # Build synthon library early: iteration == 2 (from v5/vs_opponent)
             if iteration == 2 and not top_pool.empty and synthon_lib is None:
                 try:
-                    bt.logging.info("[OPTIMIZED] Building synthon library from top molecules...")
+                    bt.logging.info("[V8] Building synthon library from top molecules...")
                     synthon_lib_start = time.time()
                     synthon_lib = SynthonLibrary(DB_PATH, rxn_id)
                     use_synthon_search = True
-                    bt.logging.info(f"[OPTIMIZED] Synthon library ready! Built in {time.time() - synthon_lib_start:.2f}s")
+                    bt.logging.info(f"[V8] Synthon library ready! Built in {time.time() - synthon_lib_start:.2f}s")
                 except Exception as e:
                     bt.logging.warning(f"[Miner] Could not build synthon library: {e}")
                     use_synthon_search = False
@@ -256,7 +255,7 @@ def main(config: dict):
             
             # WINNING STRATEGY: Intelligent exploration/exploitation balance
             if iteration == 1:
-                bt.logging.info(f"[OPTIMIZED] Iteration {iteration}: Initial broad random sampling ({n_samples_first_iteration} samples)")
+                bt.logging.info(f"[V8] Iteration {iteration}: Initial broad random sampling")
                 data = generate_valid_random_molecules_batch(
                     rxn_id,
                     n_samples=n_samples_first_iteration,
@@ -270,9 +269,8 @@ def main(config: dict):
                     component_weights=None,
                 )
             
-            # ========== EARLY SYNTHON SEARCH (from v7: iteration > 1 instead of > 2) ==========
-            elif use_synthon_search and iteration > 1 and not top_pool.empty:
-                bt.logging.info(f"[OPTIMIZED] Iteration {iteration}: EARLY synthon search (from iter 2)")
+            elif use_synthon_search and iteration > 1 and not top_pool.empty:  # Early start from v5
+                bt.logging.info(f"[V8] Iteration {iteration}: Smart synthon similarity search")
                 
                 # Get current max score for adaptive strategy
                 current_max_score = top_pool['score'].max() if not top_pool.empty else None
@@ -281,7 +279,7 @@ def main(config: dict):
                 if len(max_score_history) > 5:
                     max_score_history.pop(0)
                 
-                # ========== IMPROVED SCORE CALCULATION (from v7) ==========
+                # IMPROVED SCORE CALCULATION (from v7/vs_opponent)
                 if current_avg_score is not None and prev_avg_score is not None:
                     avg_improvement = (current_avg_score - prev_avg_score) / max(abs(prev_avg_score), 1e-6)
                 else:
@@ -292,9 +290,9 @@ def main(config: dict):
                 else:
                     max_improvement = 0.0
                 
-                # Use max of avg and weighted max improvement
+                # Combined improvement rate (from v7)
                 score_improvement_rate = max(avg_improvement, max_improvement * 0.5)
-                bt.logging.info(f"[OPTIMIZED] Improved score calc: avg={avg_improvement:.4f}, max={max_improvement:.4f}, final={score_improvement_rate:.4f}")
+                bt.logging.info(f"[V8] Improved score calc: avg={avg_improvement:.4f}, max={max_improvement:.4f}, final={score_improvement_rate:.4f}")
                 
                 # SMART: Adaptive strategy based on improvement rate AND absolute score
                 has_high_score = current_max_score is not None and current_max_score > 0.01
@@ -311,7 +309,7 @@ def main(config: dict):
                     n_per_base = 15
                     n_seeds = 20
                     synthon_ratio = 0.75
-                    bt.logging.info(f"[OPTIMIZED] High improvement ({score_improvement_rate:.4f}), tight similarity (0.75)")
+                    bt.logging.info(f"[V8] High improvement ({score_improvement_rate:.4f}), tight similarity (0.75)")
                 
                 elif score_improvement_rate > 0.02:
                     # Good improvement: medium-tight exploration
@@ -319,7 +317,7 @@ def main(config: dict):
                     n_per_base = 18
                     n_seeds = 25
                     synthon_ratio = 0.75
-                    bt.logging.info(f"[OPTIMIZED] Good improvement ({score_improvement_rate:.4f}), medium-tight similarity (0.70)")
+                    bt.logging.info(f"[V8] Good improvement ({score_improvement_rate:.4f}), medium-tight similarity (0.70)")
                 
                 elif score_improvement_rate > 0.005:
                     # Moderate improvement: balanced exploration
@@ -327,64 +325,64 @@ def main(config: dict):
                     n_per_base = 20
                     n_seeds = 30
                     synthon_ratio = 0.70
-                    bt.logging.info(f"[OPTIMIZED] Moderate improvement ({score_improvement_rate:.4f}), medium similarity (0.65)")
+                    bt.logging.info(f"[V8] Moderate improvement ({score_improvement_rate:.4f}), medium similarity (0.65)")
                 
                 else:
-                    # ========== OPTIMIZED TOP-1 FOCUSED STRATEGY (from v7: 35% budget) ==========
-                    bt.logging.info(f"[OPTIMIZED] Low improvement ({score_improvement_rate:.4f}), using OPTIMIZED TOP-1 strategy")
+                    # Low/no improvement - PROVEN MULTI-RANGE STRATEGY (from vs_opponent/v7)
+                    bt.logging.info(f"[V8] Low improvement ({score_improvement_rate:.4f}), using PROVEN MULTI-RANGE strategy")
                     
                     # SMART: Adjust strategy based on absolute score and time
                     if has_very_high_score or is_very_late_stage:
                         # When we have very high scores, add focused exploitation on TOP 1
-                        # Part 1: Ultra-tight on TOP 1 molecule (35% of synthon budget - from v7)
-                        n_synthon_top1 = int(n_samples * 0.245)  # 35%
+                        # Part 1: Ultra-tight on TOP 1 molecule (30% of synthon budget)
+                        n_synthon_top1 = int(n_samples * 0.21)  # 30% of 70%
                         synthon_top1_df = generate_molecules_from_synthon_library(
                             synthon_lib,
                             top_pool.head(1),  # TOP 1 ONLY
                             n_synthon_top1,
-                            min_similarity=0.86,  # Very tight - from v7
-                            n_per_base=75  # High variations - from v7
+                            min_similarity=0.85,  # Very tight
+                            n_per_base=50
                         )
-                        bt.logging.info(f"[OPTIMIZED] Generated {len(synthon_top1_df)} TOP-1 synthon candidates (sim=0.86, n_per=75)")
+                        bt.logging.info(f"[V8] Generated {len(synthon_top1_df)} TOP-1 synthon candidates (sim=0.85)")
                         
-                        # Part 2: Balanced on TOP 5 (25% of synthon budget - from v7)
-                        n_synthon_tight = int(n_samples * 0.175)  # 25%
+                        # Part 2: Ultra-tight on top 5 molecules (10% of synthon budget)
+                        n_synthon_tight = int(n_samples * 0.07)  # 10% of 70%
                         synthon_tight_df = generate_molecules_from_synthon_library(
                             synthon_lib,
                             top_pool.head(5),
                             n_synthon_tight,
-                            min_similarity=0.78,  # Tight - from v7
-                            n_per_base=40  # From v7
+                            min_similarity=0.80,  # Tight
+                            n_per_base=30
                         )
-                        bt.logging.info(f"[OPTIMIZED] Generated {len(synthon_tight_df)} TOP-5 synthon candidates (sim=0.78)")
+                        bt.logging.info(f"[V8] Generated {len(synthon_tight_df)} TIGHT synthon candidates (sim=0.80)")
                         
-                        # Part 3: Medium on molecules 10-35 (25% of synthon budget - from v7)
-                        n_synthon_medium = int(n_samples * 0.175)  # 25%
-                        seed_medium = top_pool.iloc[10:35] if len(top_pool) > 35 else top_pool.iloc[5:]
+                        # Part 3: Medium on molecules 10-40 (30% of synthon budget)
+                        n_synthon_medium = int(n_samples * 0.21)  # 30% of 70%
+                        seed_medium = top_pool.iloc[10:40] if len(top_pool) > 40 else top_pool.iloc[5:]
                         synthon_medium_df = generate_molecules_from_synthon_library(
                             synthon_lib,
                             seed_medium,
                             n_synthon_medium,
-                            min_similarity=0.58,  # Medium - from v7
-                            n_per_base=18  # From v7
+                            min_similarity=0.55,  # Medium - like richard1220v3
+                            n_per_base=15
                         )
-                        bt.logging.info(f"[OPTIMIZED] Generated {len(synthon_medium_df)} MEDIUM synthon candidates (sim=0.58)")
+                        bt.logging.info(f"[V8] Generated {len(synthon_medium_df)} MEDIUM synthon candidates (sim=0.55)")
                         
-                        # Part 4: Broad on top 50 (15% of synthon budget - from v7)
-                        n_synthon_broad = int(n_samples * 0.105)  # 15%
+                        # Part 4: Broad on top 50 (30% of synthon budget)
+                        n_synthon_broad = int(n_samples * 0.21)  # 30% of 70%
                         synthon_broad_df = generate_molecules_from_synthon_library(
                             synthon_lib,
                             top_pool.head(50),
                             n_synthon_broad,
-                            min_similarity=0.42,  # Broad - from v7
-                            n_per_base=18  # From v7
+                            min_similarity=0.40,  # Broad - like richard1220v3
+                            n_per_base=20
                         )
-                        bt.logging.info(f"[OPTIMIZED] Generated {len(synthon_broad_df)} BROAD synthon candidates (sim=0.42)")
+                        bt.logging.info(f"[V8] Generated {len(synthon_broad_df)} BROAD synthon candidates (sim=0.40)")
                         
                         # Combine all synthon approaches
                         synthon_df = pd.concat([synthon_top1_df, synthon_tight_df, synthon_medium_df, synthon_broad_df], ignore_index=True)
                     else:
-                        # Standard: PROVEN multi-range strategy
+                        # Standard: PROVEN multi-range strategy from richard1220v3
                         # Part 1: Ultra-tight on top 5 molecules (40% of synthon budget)
                         n_synthon_tight = int(n_samples * 0.28)  # 40% of 70%
                         synthon_tight_df = generate_molecules_from_synthon_library(
@@ -394,7 +392,7 @@ def main(config: dict):
                             min_similarity=0.80,  # Very tight!
                             n_per_base=30
                         )
-                        bt.logging.info(f"[OPTIMIZED] Generated {len(synthon_tight_df)} TIGHT synthon candidates (sim=0.80)")
+                        bt.logging.info(f"[V8] Generated {len(synthon_tight_df)} TIGHT synthon candidates (sim=0.80)")
                         
                         # Part 2: Medium on molecules 10-40 (30% of synthon budget)
                         n_synthon_medium = int(n_samples * 0.21)  # 30% of 70%
@@ -403,10 +401,10 @@ def main(config: dict):
                             synthon_lib,
                             seed_medium,
                             n_synthon_medium,
-                            min_similarity=0.55,  # Medium
+                            min_similarity=0.55,  # Medium - like richard1220v3
                             n_per_base=15
                         )
-                        bt.logging.info(f"[OPTIMIZED] Generated {len(synthon_medium_df)} MEDIUM synthon candidates (sim=0.55)")
+                        bt.logging.info(f"[V8] Generated {len(synthon_medium_df)} MEDIUM synthon candidates (sim=0.55)")
                         
                         # Part 3: Broad on top 50 (30% of synthon budget)
                         n_synthon_broad = int(n_samples * 0.21)  # 30% of 70%
@@ -414,10 +412,10 @@ def main(config: dict):
                             synthon_lib,
                             top_pool.head(50),
                             n_synthon_broad,
-                            min_similarity=0.40,  # Broad
+                            min_similarity=0.40,  # Broad - like richard1220v3
                             n_per_base=20
                         )
-                        bt.logging.info(f"[OPTIMIZED] Generated {len(synthon_broad_df)} BROAD synthon candidates (sim=0.40)")
+                        bt.logging.info(f"[V8] Generated {len(synthon_broad_df)} BROAD synthon candidates (sim=0.40)")
                         
                         # Combine all synthon approaches
                         synthon_df = pd.concat([synthon_tight_df, synthon_medium_df, synthon_broad_df], ignore_index=True)
@@ -426,7 +424,7 @@ def main(config: dict):
                     
                     if not synthon_df.empty:
                         synthon_df = validate_molecules(synthon_df, config)
-                        bt.logging.info(f"[OPTIMIZED] {len(synthon_df)} multi-range synthon candidates passed validation")
+                        bt.logging.info(f"[V8] {len(synthon_df)} multi-range synthon candidates passed validation")
                     
                     # Generate remaining from GA with component weighting
                     n_traditional = n_samples - len(synthon_df)
@@ -448,7 +446,7 @@ def main(config: dict):
                     
                     data = pd.concat([synthon_df, traditional_df], ignore_index=True)
                     data = data.drop_duplicates(subset=["name"], keep="first")
-                    bt.logging.info(f"[OPTIMIZED] Combined: {len(data)} total ({len(synthon_df)} multi-range synthon + {len(traditional_df)} GA)")
+                    bt.logging.info(f"[V8] Combined: {len(data)} total ({len(synthon_df)} multi-range synthon + {len(traditional_df)} GA)")
                     
                     # Skip the standard synthon generation below
                     synthon_df = None
@@ -464,7 +462,7 @@ def main(config: dict):
                         min_similarity=sim_threshold,
                         n_per_base=n_per_base
                     )
-                    bt.logging.info(f"[OPTIMIZED] Generated {len(synthon_df)} synthon candidates in {time.time() - synthon_gen_start:.2f}s")
+                    bt.logging.info(f"[V8] Generated {len(synthon_df)} synthon candidates in {time.time() - synthon_gen_start:.2f}s")
                     
                     # Generate remaining from traditional method
                     n_traditional = n_samples - len(synthon_df)
@@ -487,14 +485,14 @@ def main(config: dict):
                     # Validate and combine
                     if not synthon_df.empty:
                         synthon_df = validate_molecules(synthon_df, config)
-                        bt.logging.info(f"[OPTIMIZED] {len(synthon_df)} synthon candidates passed validation")
+                        bt.logging.info(f"[V8] {len(synthon_df)} synthon candidates passed validation")
                     
                     data = pd.concat([synthon_df, traditional_df], ignore_index=True)
                     data = data.drop_duplicates(subset=["name"], keep="first")
-                    bt.logging.info(f"[OPTIMIZED] Combined: {len(data)} total ({len(synthon_df)} synthon + {len(traditional_df)} GA)")
+                    bt.logging.info(f"[V8] Combined: {len(data)} total ({len(synthon_df)} synthon + {len(traditional_df)} GA)")
             
             elif no_improvement_counter < 3:
-                bt.logging.info(f"[OPTIMIZED] Iteration {iteration}: Standard genetic algorithm")
+                bt.logging.info(f"[V8] Iteration {iteration}: Standard genetic algorithm")
                 data = generate_valid_random_molecules_batch(
                     rxn_id,
                     n_samples=n_samples,
@@ -509,7 +507,7 @@ def main(config: dict):
                 )
             
             elif no_improvement_counter < 6:
-                bt.logging.info(f"[OPTIMIZED] Iteration {iteration}: Exploring similar space (no_improvement={no_improvement_counter})")
+                bt.logging.info(f"[V8] Iteration {iteration}: Exploring similar space (no_improvement={no_improvement_counter})")
                 data = _cpu_random_candidates_with_similarity(
                     iteration,
                     30,
@@ -521,7 +519,7 @@ def main(config: dict):
                 seed_df = pd.DataFrame(columns=["name", "smiles", "InChIKey", "tanimoto_similarity"])
             
             else:
-                bt.logging.info(f"[OPTIMIZED] Iteration {iteration}: Broad exploration reset (no_improvement={no_improvement_counter})")
+                bt.logging.info(f"[V8] Iteration {iteration}: Broad exploration reset (no_improvement={no_improvement_counter})")
                 data = _cpu_random_candidates_with_similarity(
                     iteration,
                     40,
@@ -534,10 +532,10 @@ def main(config: dict):
                 no_improvement_counter = 0
             
             gen_time = time.time() - iter_start_time
-            bt.logging.info(f"[OPTIMIZED] Iteration {iteration}: {len(data)} Samples Generated in ~{gen_time:.2f}s (pre-score)")
+            bt.logging.info(f"[V8] Iteration {iteration}: {len(data)} Samples Generated in ~{gen_time:.2f}s (pre-score)")
 
             if data.empty:
-                bt.logging.warning(f"[OPTIMIZED] Iteration {iteration}: No valid molecules produced; continuing")
+                bt.logging.warning(f"[V8] Iteration {iteration}: No valid molecules produced; continuing")
                 continue
             
             if not seed_df.empty:
@@ -549,7 +547,7 @@ def main(config: dict):
                 filterd_data = data[~data["InChIKey"].isin(seen_inchikeys)]
                 if len(filterd_data) < len(data):
                     bt.logging.warning(
-                        f"[OPTIMIZED] Iteration {iteration}: {len(data) - len(filterd_data)} molecules were previously seen"
+                        f"[V8] Iteration {iteration}: {len(data) - len(filterd_data)} molecules were previously seen"
                     )
 
                 dup_ratio = (len(data) - len(filterd_data)) / max(1, len(data))
@@ -557,11 +555,11 @@ def main(config: dict):
                 if dup_ratio > 0.7:
                     mutation_prob = min(0.9, mutation_prob * 1.5)
                     elite_frac = max(0.15, elite_frac * 0.7)
-                    bt.logging.warning(f"[OPTIMIZED] SEVERE duplication ({dup_ratio:.2%})! mut={mutation_prob:.2f}, elite={elite_frac:.2f}")
+                    bt.logging.warning(f"[V8] SEVERE duplication ({dup_ratio:.2%})! mut={mutation_prob:.2f}, elite={elite_frac:.2f}")
                 elif dup_ratio > 0.5:
                     mutation_prob = min(0.7, mutation_prob * 1.3)
                     elite_frac = max(0.2, elite_frac * 0.8)
-                    bt.logging.warning(f"[OPTIMIZED] High duplication ({dup_ratio:.2%}), mut={mutation_prob:.2f}, elite={elite_frac:.2f}")
+                    bt.logging.warning(f"[V8] High duplication ({dup_ratio:.2%}), mut={mutation_prob:.2f}, elite={elite_frac:.2f}")
                 elif dup_ratio < 0.15 and not top_pool.empty and iteration > 10:
                     mutation_prob = max(0.05, mutation_prob * 0.95)
                     elite_frac = min(0.85, elite_frac * 1.05)
@@ -569,61 +567,62 @@ def main(config: dict):
                 data = filterd_data
 
             except Exception as e:
-                bt.logging.warning(f"[OPTIMIZED] Pre-score deduplication failed: {e}")
+                bt.logging.warning(f"[V8] Pre-score deduplication failed: {e}")
 
             if data.empty:
-                bt.logging.error(f"[OPTIMIZED] Iteration {iteration}: ALL molecules were duplicates! Skipping scoring and continuing...")
+                bt.logging.error(f"[V8] Iteration {iteration}: ALL molecules were duplicates! Skipping scoring and continuing...")
                 # Force more diversity for next iteration
                 mutation_prob = min(0.95, mutation_prob * 2.0)
                 elite_frac = max(0.1, elite_frac * 0.5)
-                bt.logging.warning(f"[OPTIMIZED] Emergency diversity boost: mut={mutation_prob:.2f}, elite={elite_frac:.2f}")
+                bt.logging.warning(f"[V8] Emergency diversity boost: mut={mutation_prob:.2f}, elite={elite_frac:.2f}")
                 continue  # Skip to next iteration
 
             data = data.reset_index(drop=True)
 
-            # ========== ENHANCED CPU SIMILARITY SEARCH - 3 STRATEGIES EARLY START (from v7) ==========
+            # Enhanced CPU similarity search - multiple parallel searches (from v5/vs_opponent)
+            # Early start: iteration > 1 (from v5)
             cpu_futures = []
-            if not top_pool.empty and iteration > 1:  # Early start from v7 (was > 3)
+            if not top_pool.empty and iteration > 1:  # Early start from v5
                 # Multiple parallel CPU searches with different strategies
                 if score_improvement_rate < 0.01:
-                    # Strategy 1: Tight on top 5 (from v7)
+                    # Strategy 1: Tight on top 5
                     cpu_futures.append((
                         cpu_executor.submit(
                             _cpu_random_candidates_with_similarity,
                             iteration,
-                            50,  # Increased from v7 (40)
+                            50,  # Increased from v5
                             config,
                             top_pool.head(5)[["name", "smiles", "InChIKey"]],
                             seen_inchikeys,
-                            0.82  # Slightly higher than v7 (0.80)
+                            0.82  # Slightly higher threshold
                         ),
                         "tight-top5"
                     ))
                     
-                    # Strategy 2: Medium on top 15 (from v7)
+                    # Strategy 2: Medium on top 15 (from v5)
                     cpu_futures.append((
                         cpu_executor.submit(
                             _cpu_random_candidates_with_similarity,
                             iteration,
-                            40,  # From v7
+                            40,
                             config,
-                            top_pool.head(15)[["name", "smiles", "InChIKey"]],  # From v7 (was 20)
+                            top_pool.head(15)[["name", "smiles", "InChIKey"]],
                             seen_inchikeys,
-                            0.70  # From v7
+                            0.70
                         ),
                         "medium-top15"
                     ))
                     
-                    # Strategy 3: Broad on top 30 (from v7)
+                    # Strategy 3: Broad on top 30 (from v5)
                     cpu_futures.append((
                         cpu_executor.submit(
                             _cpu_random_candidates_with_similarity,
                             iteration,
-                            30,  # From v7
+                            30,
                             config,
-                            top_pool.head(30)[["name", "smiles", "InChIKey"]],  # From v7
+                            top_pool.head(30)[["name", "smiles", "InChIKey"]],
                             seen_inchikeys,
-                            0.55  # From v7
+                            0.55
                         ),
                         "broad-top30"
                     ))
@@ -631,7 +630,7 @@ def main(config: dict):
             gpu_start_time = time.time()
 
             if len(data) == 0:
-                bt.logging.error(f"[OPTIMIZED] Iteration {iteration}: No molecules to score! Continuing...")
+                bt.logging.error(f"[V8] Iteration {iteration}: No molecules to score! Continuing...")
                 continue
 
             data["Target"] = target_score_from_data(data["smiles"])
@@ -639,11 +638,11 @@ def main(config: dict):
             data["score"] = data["Target"] - (config["antitarget_weight"] * data["Anti"])
 
             if data["score"].isna().all():
-                bt.logging.error(f"[OPTIMIZED] Iteration {iteration}: Scoring failed (all NaN)! Continuing...")
+                bt.logging.error(f"[V8] Iteration {iteration}: Scoring failed (all NaN)! Continuing...")
                 continue
             
             gpu_time = time.time() - gpu_start_time
-            bt.logging.info(f"[OPTIMIZED] Iteration {iteration}: GPU scoring time ~{gpu_time:.2f}s")
+            bt.logging.info(f"[V8] Iteration {iteration}: GPU scoring time ~{gpu_time:.2f}s")
             
             # Collect all CPU results
             if cpu_futures:
@@ -655,11 +654,11 @@ def main(config: dict):
                                 seed_df = cpu_df.copy()
                             else:
                                 seed_df = pd.concat([seed_df, cpu_df], ignore_index=True)
-                            bt.logging.info(f"[OPTIMIZED] CPU similarity ({strategy_name}) found {len(cpu_df)} candidates")
+                            bt.logging.info(f"[V8] CPU similarity ({strategy_name}) found {len(cpu_df)} candidates")
                     except TimeoutError:
                         pass
                     except Exception as e:
-                        bt.logging.warning(f"[OPTIMIZED] CPU similarity ({strategy_name}) failed: {e}")
+                        bt.logging.warning(f"[V8] CPU similarity ({strategy_name}) failed: {e}")
                 
                 if not seed_df.empty:
                     seed_df = seed_df.drop_duplicates(subset=["InChIKey"], keep="first")
@@ -674,39 +673,37 @@ def main(config: dict):
                 top_pool = top_pool.drop_duplicates(subset=["InChIKey"], keep="first")
                 top_pool = top_pool.sort_values(by="score", ascending=False)
             else:
-                bt.logging.warning(f"[OPTIMIZED] Iteration {iteration}: No valid scored data to add to pool")
+                bt.logging.warning(f"[V8] Iteration {iteration}: No valid scored data to add to pool")
 
-            # Track best molecules for later intensive exploration
-            if not top_pool.empty and iteration % 5 == 0:
+            # PERIODIC ENTROPY CHECK (from v7) - every 5 iterations
+            if iteration % 5 == 0 and not top_pool.empty:
+                try:
+                    current_entropy = compute_maccs_entropy(
+                        top_pool.head(config["num_molecules"])['smiles'].to_list()
+                    )
+                    bt.logging.info(f"[V8] Periodic entropy check: {current_entropy:.4f}")
+                    
+                    if current_entropy < config['entropy_min_threshold'] * 1.2:
+                        mutation_prob = min(0.8, mutation_prob * 1.3)
+                        elite_frac = max(0.3, elite_frac * 0.8)
+                        bt.logging.warning(f"[V8] Low entropy detected, boosting diversity: mut={mutation_prob:.2f}, elite={elite_frac:.2f}")
+                except Exception as e:
+                    bt.logging.warning(f"[V8] Entropy check failed: {e}")
+                
+                # Track best molecules for later intensive exploration
                 best_molecules_history.append({
                     'iteration': iteration,
                     'molecules': top_pool.head(10)[["name", "smiles", "InChIKey", "score"]].copy()
                 })
                 if len(best_molecules_history) > 6:
                     best_molecules_history.pop(0)
-            
-            # ========== PERIODIC ENTROPY CHECK (from v7) ==========
-            if iteration % 5 == 0 and not top_pool.empty:
-                try:
-                    current_entropy = compute_maccs_entropy(
-                        top_pool.head(config["num_molecules"])['smiles'].to_list()
-                    )
-                    bt.logging.info(f"[OPTIMIZED] Periodic entropy check: {current_entropy:.4f}")
-                    
-                    # Boost diversity if entropy is low
-                    if current_entropy < config['entropy_min_threshold'] * 1.2:
-                        mutation_prob = min(0.8, mutation_prob * 1.3)
-                        elite_frac = max(0.3, elite_frac * 0.8)
-                        bt.logging.warning(f"[OPTIMIZED] Low entropy detected, boosting diversity: mut={mutation_prob:.2f}, elite={elite_frac:.2f}")
-                except Exception as e:
-                    bt.logging.warning(f"[OPTIMIZED] Entropy check failed: {e}")
 
             remaining_time = 1800 - (time.time() - start)
             if remaining_time <= 60:
                 entropy = compute_maccs_entropy(top_pool.iloc[:config["num_molecules"]]['smiles'].to_list())
                 if entropy > config['entropy_min_threshold']:
                     top_pool = top_pool.head(config["num_molecules"])
-                    bt.logging.info(f"[OPTIMIZED] Iteration {iteration}: Sufficient Entropy = {entropy:.4f}")
+                    bt.logging.info(f"[V8] Iteration {iteration}: Sufficient Entropy = {entropy:.4f}")
                 else:
                     try:
                         top_95 = top_pool.iloc[:95]
@@ -716,26 +713,19 @@ def main(config: dict):
                         if not additional_5.empty:
                             top_pool = pd.concat([top_95, additional_5]).reset_index(drop=True)
                             entropy = compute_maccs_entropy(top_pool['smiles'].to_list())
-                            bt.logging.info(f"[OPTIMIZED] Iteration {iteration}: Adjusted Entropy = {entropy:.4f}")
+                            bt.logging.info(f"[V8] Iteration {iteration}: Adjusted Entropy = {entropy:.4f}")
                         else:
                             top_pool = top_pool.head(config["num_molecules"])
                     except Exception as e:
-                        bt.logging.warning(f"[OPTIMIZED] Entropy handling failed: {e}")
+                        bt.logging.warning(f"[V8] Entropy handling failed: {e}")
             else:
                 top_pool = top_pool.head(config["num_molecules"])
             
             current_avg_score = top_pool['score'].mean() if not top_pool.empty else None
 
-            # Update score improvement rate using improved calculation
             if current_avg_score is not None:
                 if prev_avg_score is not None:
-                    # Use improved calculation from v7
-                    avg_improvement = (current_avg_score - prev_avg_score) / max(abs(prev_avg_score), 1e-6)
-                    if len(max_score_history) >= 2:
-                        max_improvement = (max_score_history[-1] - max_score_history[-2]) / max(abs(max_score_history[-2]), 1e-6)
-                        score_improvement_rate = max(avg_improvement, max_improvement * 0.5)
-                    else:
-                        score_improvement_rate = avg_improvement
+                    score_improvement_rate = (current_avg_score - prev_avg_score) / max(abs(prev_avg_score), 1e-6)
                 prev_avg_score = current_avg_score
 
             if score_improvement_rate == 0.0:
@@ -748,7 +738,7 @@ def main(config: dict):
             total_time = time.time() - start
             
             bt.logging.info(
-                f"[OPTIMIZED] Iteration {iteration} || Time: {iter_total_time:.2f}s | Total: {total_time:.2f}s | "
+                f"[V8] Iteration {iteration} || Time: {iter_total_time:.2f}s | Total: {total_time:.2f}s | "
                 f"Avg: {top_pool['score'].mean():.4f} | Max: {top_pool['score'].max():.4f} | "
                 f"Min: {top_pool['score'].min():.4f} | Elite: {elite_frac:.2f} | "
                 f"Mut: {mutation_prob:.2f} | Improve: {score_improvement_rate:.4f}"
