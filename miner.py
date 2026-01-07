@@ -208,7 +208,7 @@ def main(config: dict):
     n_samples_first_iteration = base_n_samples * 6 if config["allowed_reaction"] != "rxn:5" else base_n_samples * 3
 
     # Use 3 CPU workers for parallel exploration (from vs_opponent)
-    with ProcessPoolExecutor(max_workers=3) as cpu_executor:
+    with ProcessPoolExecutor(max_workers=2) as cpu_executor:
         while time.time() - start < 1800:
             iteration += 1
             iter_start_time = time.time()
