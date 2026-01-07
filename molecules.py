@@ -1,757 +1,1010 @@
-import os
-from traceback import print_exc
-os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
-import sys
-import json
-import time
+from rdkit import Chem, DataStructs
 import bittensor as bt
-from concurrent.futures import ProcessPoolExecutor, TimeoutError
+from rdkit.Chem import Descriptors, MACCSkeys, AllChem
+from rdkit.Chem import rdFingerprintGenerator
+from dotenv import load_dotenv
 import pandas as pd
-from pathlib import Path
-import nova_ph2
-from itertools import combinations
+import warnings
+import sqlite3
+import random
+import os
+from functools import lru_cache
+from typing import List, Tuple, Dict
+load_dotenv(override=True)
+warnings.filterwarnings("ignore", category=pd.errors.SettingWithCopyWarning)
+from nova_ph2.combinatorial_db.reactions import get_smiles_from_reaction, get_reaction_info
+from nova_ph2.utils.molecules import get_heavy_atom_count
+from collections import defaultdict
+from itertools import chain
+import numpy as np
+import math
 
-BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__)))
-PARENT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-sys.path.append(PARENT_DIR)
+# Try to import synthon search
+try:
+    from rdkit.Chem import rdSynthonSpaceSearch
+    SYNTHON_SEARCH_AVAILABLE = True
+except ImportError:
+    SYNTHON_SEARCH_AVAILABLE = False
+    bt.logging.warning("RDKit synthon search not available, using fingerprint similarity")
 
-OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/output")
-
-from nova_ph2.PSICHIC.wrapper import PsichicWrapper
-from nova_ph2.PSICHIC.psichic_utils.data_utils import virtual_screening
-from molecules import (
-    generate_valid_random_molecules_batch,
-    select_diverse_elites,
-    build_component_weights,
-    compute_tanimoto_similarity_to_pool,
-    sample_random_valid_molecules,
-    compute_maccs_entropy,
-    SynthonLibrary,
-    generate_molecules_from_synthon_library,
-    validate_molecules,
-)
-
-DB_PATH = str(Path(nova_ph2.__file__).resolve().parent / "combinatorial_db" / "molecules.sqlite")
-
-
-target_models = []
-antitarget_models = []
-
-def get_config(input_file: str = os.path.join(BASE_DIR, "input.json")):
-    with open(input_file, "r") as f:
-        d = json.load(f)
-    return {**d.get("config", {}), **d.get("challenge", {})}
+# Create global Morgan fingerprint generator to avoid deprecation warnings
+MORGAN_FP_GENERATOR = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
 
 
-def initialize_models(config: dict):
-    """Initialize separate model instances for each target and antitarget sequence."""
-    global target_models, antitarget_models
-    target_models = []
-    antitarget_models = []
-    
-    for seq in config["target_sequences"]:
-        wrapper = PsichicWrapper()
-        wrapper.initialize_model(seq)
-        target_models.append(wrapper)
-    
-    for seq in config["antitarget_sequences"]:
-        wrapper = PsichicWrapper()
-        wrapper.initialize_model(seq)
-        antitarget_models.append(wrapper)
-
-
-# ---------- scoring helpers (reuse pre-initialized models) ----------
-def target_score_from_data(data: pd.Series):
-    """Score molecules against all target models."""
-    global target_models, antitarget_models
+@lru_cache(maxsize=1000_000)
+def _get_smiles_from_reaction_cached(name: str):
+    """Cache SMILES retrieval to avoid repeated database queries."""
     try:
-        target_scores = []
-        smiles_list = data.tolist()
-        for target_model in target_models:
-            scores = target_model.score_molecules(smiles_list)
-            for antitarget_model in antitarget_models:
-                antitarget_model.smiles_list = smiles_list
-                antitarget_model.smiles_dict = target_model.smiles_dict
+        return get_smiles_from_reaction(name)
+    except Exception:
+        return None
 
-            scores.rename(columns={'predicted_binding_affinity': "target"}, inplace=True)
-            target_scores.append(scores["target"])
-        # Average across all targets
-        target_series = pd.DataFrame(target_scores).mean(axis=0)
-        return target_series
-    except Exception as e:
-        bt.logging.error(f"Target scoring error: {e}")
-        return pd.Series(dtype=float)
-
-
-def antitarget_scores():
-    """Score molecules against all antitarget models."""
-    
-    global antitarget_models
+@lru_cache(maxsize=1000_000)
+def _mol_from_smiles_cached(smiles: str):
+    """Cache molecule parsing to avoid repeated SMILES parsing."""
+    if not smiles:
+        return None
     try:
-        antitarget_scores = []
-        for i, antitarget_model in enumerate(antitarget_models):
-            antitarget_model.create_screen_loader(antitarget_model.protein_dict, antitarget_model.smiles_dict)
-            antitarget_model.screen_df = virtual_screening(antitarget_model.screen_df, 
-                                            antitarget_model.model, 
-                                            antitarget_model.screen_loader,
-                                            os.getcwd(),
-                                            save_interpret=False,
-                                            ligand_dict=antitarget_model.smiles_dict, 
-                                            device=antitarget_model.device,
-                                            save_cluster=False,
-                                            )
-            scores = antitarget_model.screen_df[['predicted_binding_affinity']]
-            scores.rename(columns={'predicted_binding_affinity': f"anti_{i}"}, inplace=True)
-            antitarget_scores.append(scores[f"anti_{i}"])
-        
-        if not antitarget_scores:
-            return pd.Series(dtype=float)
-        
-        # average across antitargets
-        anti_series = pd.DataFrame(antitarget_scores).mean(axis=0)
-        return anti_series
+        return Chem.MolFromSmiles(smiles)
+    except Exception:
+        return None
+
+
+@lru_cache(maxsize=1000_000)
+def _maccs_fp_from_smiles_cached(smiles: str):
+    """Cache MACCS fingerprints for SMILES strings for fast Tanimoto similarity."""
+    if not smiles:
+        return None
+    try:
+        mol = _mol_from_smiles_cached(smiles)
+        if mol is None:
+            return None
+        return MACCSkeys.GenMACCSKeys(mol)
+    except Exception:
+        return None
+
+@lru_cache(maxsize=1000_000)
+def _inchikey_from_name_cached(name: str) -> str:
+    """Cache InChIKey generation from molecule name to avoid repeated computation."""
+    try:
+        s = _get_smiles_from_reaction_cached(name)
+        if not s:
+            return ""
+        return generate_inchikey(s)
+    except Exception:
+        return ""
+
+def compute_maccs_entropy(smiles_list: list[str]) -> float:
+    n_bits = 167  # RDKit uses 167 bits (index 0 is always 0)
+    bit_counts = np.zeros(n_bits)
+    valid_mols = 0
+
+    for smi in smiles_list:
+        fp = _maccs_fp_from_smiles_cached(smi)
+        if fp is not None:
+            arr = np.array(fp)
+            bit_counts += arr
+            valid_mols += 1
+
+    if valid_mols == 0:
+        raise ValueError("No valid molecules found.")
+
+    probs = bit_counts / valid_mols
+    entropy_per_bit = np.array([
+        -p * math.log2(p) - (1 - p) * math.log2(1 - p) if 0 < p < 1 else 0
+        for p in probs
+    ])
+
+    avg_entropy = np.mean(entropy_per_bit)
+
+    return avg_entropy
+
+def num_rotatable_bonds(smiles: str) -> int:
+    """Get number of rotatable bonds from SMILES string."""
+    if not smiles:
+        return 0
+    try:
+        mol = _mol_from_smiles_cached(smiles)
+        if mol is None:
+            return 0
+        return Descriptors.NumRotatableBonds(mol)
+    except Exception:
+        return 0
+
+@lru_cache(maxsize=1000_000)
+def generate_inchikey(smiles: str) -> str:
+    """Generate InChIKey from SMILES string."""
+    if not smiles:
+        return ""
+    try:
+        mol = _mol_from_smiles_cached(smiles)
+        if mol is None:
+            return ""
+        return Chem.MolToInchiKey(mol)
     except Exception as e:
-        bt.logging.error(f"Antitarget scoring error: {e}")
-        return pd.Series(dtype=float)
+        bt.logging.error(f"Error generating InChIKey for SMILES {smiles}: {e}")
+        return ""
 
 
-def _cpu_random_candidates_with_similarity(
-    iteration: int,
+def compute_tanimoto_similarity_to_pool(
+    candidate_smiles: pd.Series,
+    pool_smiles: pd.Series,
+) -> pd.Series:
+    """
+    Compute, for each candidate SMILES, the maximum MACCS Tanimoto similarity
+    to any molecule in the reference pool.
+
+    Returns a Series indexed like candidate_smiles.
+    """
+    if candidate_smiles.empty or pool_smiles.empty:
+        # Return zeros with matching index
+        return pd.Series(0.0, index=candidate_smiles.index, dtype=float)
+
+    # Pre-compute fingerprints for pool molecules
+    pool_fps = []
+    for smi in pool_smiles.dropna().unique():
+        fp = _maccs_fp_from_smiles_cached(smi)
+        if fp is not None:
+            pool_fps.append(fp)
+
+    if not pool_fps:
+        return pd.Series(0.0, index=candidate_smiles.index, dtype=float)
+
+    similarities = {}
+    for idx, smi in candidate_smiles.items():
+        fp_cand = _maccs_fp_from_smiles_cached(smi)
+        if fp_cand is None:
+            similarities[idx] = 0.0
+            continue
+        max_sim = 0.0
+        for fp_ref in pool_fps:
+            try:
+                sim = DataStructs.TanimotoSimilarity(fp_cand, fp_ref)
+            except Exception:
+                sim = 0.0
+            if sim > max_sim:
+                max_sim = sim
+        similarities[idx] = float(max_sim)
+
+    return pd.Series(similarities, dtype=float)
+
+seen_cache = {}
+
+def sample_random_valid_molecules(
     n_samples: int,
     subnet_config: dict,
-    top_pool_df: pd.DataFrame,
     avoid_inchikeys: set[str] | None = None,
-    thresh: float = 0.8
+    focus_neighborhood_of: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """
-    CPU-side helper:
-    - draws a random batch of valid molecules (independent of the GPU batch),
-    - computes Tanimoto similarity vs. current top_pool,
-    - returns a DataFrame with name, smiles, InChIKey, tanimoto_similarity.
-    """
-    try:
-        random_df = sample_random_valid_molecules(
-            n_samples=n_samples,
-            subnet_config=subnet_config,
-            avoid_inchikeys=avoid_inchikeys,
-            focus_neighborhood_of=top_pool_df
-        )
-        if random_df.empty or top_pool_df.empty:
-            return pd.DataFrame(columns=["name", "smiles", "InChIKey"])
+    global seen_cache
+    
+    names = []
+    for name in focus_neighborhood_of["name"]:
+        try:
+            parts = name.split(":")
+            if len(parts) == 4:
+                rxn_prefix, rxn_type, comp1_id, comp2_id = parts
+                comp1_id = int(comp1_id)
+                comp2_id = int(comp2_id)
+                
+                # Check if this molecule has been seen before, and adjust range accordingly
+                seen_count = seen_cache.get(name, 0) + 1
+                seen_cache[name] = seen_count
 
-        sims = compute_tanimoto_similarity_to_pool(
-            candidate_smiles=random_df["smiles"],
-            pool_smiles=top_pool_df["smiles"],
-        )
-        random_df = random_df.copy()
-        random_df["tanimoto_similarity"] = sims.reindex(random_df.index).fillna(0.0)
-        random_df = random_df.sort_values(by="tanimoto_similarity", ascending=False)
-        random_df_filtered = random_df[random_df["tanimoto_similarity"] >= thresh]
-            
-        if random_df_filtered.empty:
-            return pd.DataFrame(columns=["name", "smiles", "InChIKey", "tanimoto_similarity"])
-            
-        random_df_filtered = random_df_filtered.reset_index(drop=True)
-        return random_df_filtered[["name", "smiles", "InChIKey"]]
-    except Exception as e:
-        bt.logging.warning(f"[Miner] _cpu_random_candidates_with_similarity failed: {e}")
+                comp1_range = chain(range(max(1, comp1_id - seen_count * n_samples), comp1_id - (seen_count-1) * n_samples), range(max(1, comp1_id + (seen_count - 1) * n_samples), comp1_id + seen_count * n_samples + 1))
+                for new_comp1 in comp1_range:
+                    new_name = f"{rxn_prefix}:{rxn_type}:{new_comp1}:{comp2_id}"
+                    if avoid_inchikeys and new_name in avoid_inchikeys:
+                        continue  # Skip if this molecule has already been seen
+                    names.append(new_name)
+                
+                # Generate neighborhood around comp2_id (keep comp1_id fixed)
+                comp2_range = chain(range(max(1, comp2_id - seen_count * n_samples), comp2_id - (seen_count-1) * n_samples), range(max(1, comp2_id + (seen_count - 1) * n_samples), comp2_id + seen_count * n_samples + 1))
+                for new_comp2 in comp2_range:
+                    new_name = f"{rxn_prefix}:{rxn_type}:{comp1_id}:{new_comp2}"
+                    if avoid_inchikeys and new_name in avoid_inchikeys:
+                        continue  # Skip if this molecule has already been seen
+                    names.append(new_name)
+                
+            if len(parts) == 5:
+                rxn_prefix, rxn_type, comp1_id, comp2_id, comp3_id = parts
+                comp1_id = int(comp1_id)
+                comp2_id = int(comp2_id)
+                comp3_id = int(comp3_id)
+                
+                # Check if this molecule has been seen before, and adjust range accordingly
+                seen_count = seen_cache.get(name, 0) + 1
+                seen_cache[name] = seen_count
+                # Generate neighborhood around comp1_id (keep comp2_id and comp3_id fixed)
+                comp1_range = chain(range(max(1, comp1_id - seen_count * n_samples), comp1_id - (seen_count-1) * n_samples), range(max(1, comp1_id + (seen_count - 1) * n_samples), comp1_id + seen_count * n_samples + 1))
+                for new_comp1 in comp1_range:
+                    new_name = f"{rxn_prefix}:{rxn_type}:{new_comp1}:{comp2_id}:{comp3_id}"
+                    if avoid_inchikeys and new_name in avoid_inchikeys:
+                        continue  # Skip if this molecule has already been seen
+                    names.append(new_name)
+                
+                # Generate neighborhood around comp2_id (keep comp1_id and comp3_id fixed)
+                comp2_range = chain(range(max(1, comp2_id - seen_count * n_samples), comp2_id - (seen_count-1) * n_samples), range(max(1, comp2_id + (seen_count - 1) * n_samples), comp2_id + seen_count * n_samples + 1))
+                for new_comp2 in comp2_range:
+                    new_name = f"{rxn_prefix}:{rxn_type}:{comp1_id}:{new_comp2}:{comp3_id}"
+                    if avoid_inchikeys and new_name in avoid_inchikeys:
+                        continue  # Skip if this molecule has already been seen
+                    names.append(new_name)
+                
+                # Generate neighborhood around comp3_id (keep comp1_id and comp2_id fixed)
+                comp3_range = chain(range(max(1, comp3_id - seen_count * n_samples), comp3_id - (seen_count-1) * n_samples), range(max(1, comp3_id + (seen_count - 1) * n_samples), comp3_id + seen_count * n_samples + 1))
+                for new_comp3 in comp3_range:
+                    new_name = f"{rxn_prefix}:{rxn_type}:{comp1_id}:{comp2_id}:{new_comp3}"
+                    if avoid_inchikeys and new_name in avoid_inchikeys:
+                        continue  # Skip if this molecule has already been seen
+                    names.append(new_name)
+
+        except (ValueError, IndexError) as e:
+            bt.logging.warning(f"Could not parse name '{name}': {e}")
+            continue
+    
+    if not names:
         return pd.DataFrame(columns=["name", "smiles", "InChIKey"])
 
-def select_diverse_subset(pool, top_95_smiles, subset_size=5, entropy_threshold=0.1):
-    smiles_list = pool["smiles"].tolist()
-    for combination in combinations(smiles_list, subset_size):
-        test_subset = top_95_smiles + list(combination)
-        entropy = compute_maccs_entropy(test_subset)
-        if entropy >= entropy_threshold:
-            bt.logging.info(f"Entropy Threshold Met: {entropy:.4f}")
-            return pool[pool["smiles"].isin(combination)]
-
-    bt.logging.warning("No combination exceeded the given entropy threshold.")
-    return pd.DataFrame()
-
-
-def main(config: dict):
-    # V8 COMBINED: Best features from v1-v7 + vs_opponent
-    # - base_n_samples=1800 (from v1/v4/v6/v7) for higher exploration
-    # - max_workers=3 (from vs_opponent) for better parallel processing
-    # - Early synthon search: iteration > 1 (from v5/vs_opponent)
-    # - Dynamic sample size boosting (from v5) - adapts to improvement rate
-    # - Improved score calculation (from v7/vs_opponent) - avg + max weighted
-    # - Periodic entropy checks (from v7) - every 5 iterations
-    # - TOP-1 focused strategy (from v7/vs_opponent) - when scores are very high
-    # - Early CPU search: iteration > 1 (from v5) - 3 strategies
-    # - Better multi-range strategy (from v7/vs_opponent) - TOP-1, TOP-5, medium, broad
-    base_n_samples = 3000  # Higher exploration from v1/v4/v6/v7
-    top_pool = pd.DataFrame(columns=["name", "smiles", "InChIKey", "score", "Target", "Anti"])
-    rxn_id = int(config["allowed_reaction"].split(":")[-1])
-    iteration = 0
+    df = pd.DataFrame({"name": names})
     
-    mutation_prob = 0.3
-    elite_frac = 0.6
-    
-    seen_inchikeys = set()
-    seed_df = pd.DataFrame(columns=["name", "smiles", "InChIKey", "tanimoto_similarity"])
-    start = time.time()
-    prev_avg_score = None
-    current_avg_score = None
-    score_improvement_rate = 0.0
-    no_improvement_counter = 0
-    
-    synthon_lib = None
-    use_synthon_search = False
-    
-    # Track best molecules and score history for adaptive strategies
-    best_molecules_history = []
-    max_score_history = []
-    
-    # Enhanced first iteration - good exploration
-    n_samples_first_iteration = base_n_samples * 6 if config["allowed_reaction"] != "rxn:5" else base_n_samples * 3
+    df = df[df["name"].notna()]
+    if df.empty:
+        return pd.DataFrame(columns=["name", "smiles", "InChIKey"])
 
-    # Use 3 CPU workers for parallel exploration (from vs_opponent)
-    with ProcessPoolExecutor(max_workers=3) as cpu_executor:
-        while time.time() - start < 1800:
-            iteration += 1
-            iter_start_time = time.time()
-            
-            # Adaptive n_samples: maintain good throughput + dynamic boosting (from v5)
-            remaining_time = 1800 - (time.time() - start)
-            if remaining_time > 1500:
-                base_adaptive = base_n_samples
-            elif remaining_time > 900:
-                base_adaptive = int(base_n_samples * 0.95)
-            elif remaining_time > 600:
-                base_adaptive = int(base_n_samples * 0.90)
-            elif remaining_time > 300:
-                base_adaptive = int(base_n_samples * 0.85)
-            else:
-                base_adaptive = int(base_n_samples * 0.80)
-            
-            # Dynamic sample size boosting based on improvement rate (from v5)
-            if score_improvement_rate > 0.05:
-                n_samples = int(base_adaptive * 1.5)  # Boost when improving fast
-                bt.logging.info(f"[V8] High improvement, BOOSTED samples: {n_samples}")
-            elif score_improvement_rate > 0.02:
-                n_samples = int(base_adaptive * 1.2)
-                bt.logging.info(f"[V8] Good improvement, increased samples: {n_samples}")
-            else:
-                n_samples = base_adaptive
-            
-            # Build synthon library early: iteration == 2 (from v5/vs_opponent)
-            if iteration == 2 and not top_pool.empty and synthon_lib is None:
-                try:
-                    bt.logging.info("[V8] Building synthon library from top molecules...")
-                    synthon_lib_start = time.time()
-                    synthon_lib = SynthonLibrary(DB_PATH, rxn_id)
-                    use_synthon_search = True
-                    bt.logging.info(f"[V8] Synthon library ready! Built in {time.time() - synthon_lib_start:.2f}s")
-                except Exception as e:
-                    bt.logging.warning(f"[Miner] Could not build synthon library: {e}")
-                    use_synthon_search = False
+    df = validate_molecules(df, subnet_config)
+    if df.empty:
+        return pd.DataFrame(columns=["name", "smiles", "InChIKey"])
 
-            component_weights = build_component_weights(top_pool, rxn_id) if not top_pool.empty else None
-            # Enhanced elite pool
-            elite_df = select_diverse_elites(top_pool, min(150, len(top_pool))) if not top_pool.empty else pd.DataFrame()
-            elite_names = elite_df["name"].tolist() if not elite_df.empty else None
-            
-            # WINNING STRATEGY: Intelligent exploration/exploitation balance
-            if iteration == 1:
-                bt.logging.info(f"[V8] Iteration {iteration}: Initial broad random sampling")
-                data = generate_valid_random_molecules_batch(
-                    rxn_id,
-                    n_samples=n_samples_first_iteration,
-                    db_path=DB_PATH,
-                    subnet_config=config,
-                    batch_size=400,
-                    elite_names=None,
-                    elite_frac=0.0,
-                    mutation_prob=1.0,
-                    avoid_inchikeys=seen_inchikeys,
-                    component_weights=None,
-                )
-            
-            elif use_synthon_search and iteration > 1 and not top_pool.empty:  # Early start from v5
-                bt.logging.info(f"[V8] Iteration {iteration}: Smart synthon similarity search")
-                
-                # Get current max score for adaptive strategy
-                current_max_score = top_pool['score'].max() if not top_pool.empty else None
-                current_avg_score = top_pool['score'].mean() if not top_pool.empty else None
-                max_score_history.append(current_max_score)
-                if len(max_score_history) > 5:
-                    max_score_history.pop(0)
-                
-                # IMPROVED SCORE CALCULATION (from v7/vs_opponent)
-                if current_avg_score is not None and prev_avg_score is not None:
-                    avg_improvement = (current_avg_score - prev_avg_score) / max(abs(prev_avg_score), 1e-6)
-                else:
-                    avg_improvement = 0.0
-                
-                if len(max_score_history) >= 2:
-                    max_improvement = (max_score_history[-1] - max_score_history[-2]) / max(abs(max_score_history[-2]), 1e-6)
-                else:
-                    max_improvement = 0.0
-                
-                # Combined improvement rate (from v7)
-                score_improvement_rate = max(avg_improvement, max_improvement * 0.5)
-                bt.logging.info(f"[V8] Improved score calc: avg={avg_improvement:.4f}, max={max_improvement:.4f}, final={score_improvement_rate:.4f}")
-                
-                # SMART: Adaptive strategy based on improvement rate AND absolute score
-                has_high_score = current_max_score is not None and current_max_score > 0.01
-                has_very_high_score = current_max_score is not None and current_max_score > 0.015
-                
-                # Time-based strategy
-                time_elapsed = time.time() - start
-                is_late_stage = time_elapsed > 1200
-                is_very_late_stage = time_elapsed > 1500
-                
-                if score_improvement_rate > 0.05:
-                    # High improvement: tight exploration
-                    sim_threshold = 0.75
-                    n_per_base = 15
-                    n_seeds = 20
-                    synthon_ratio = 0.75
-                    bt.logging.info(f"[V8] High improvement ({score_improvement_rate:.4f}), tight similarity (0.75)")
-                
-                elif score_improvement_rate > 0.02:
-                    # Good improvement: medium-tight exploration
-                    sim_threshold = 0.70
-                    n_per_base = 18
-                    n_seeds = 25
-                    synthon_ratio = 0.75
-                    bt.logging.info(f"[V8] Good improvement ({score_improvement_rate:.4f}), medium-tight similarity (0.70)")
-                
-                elif score_improvement_rate > 0.005:
-                    # Moderate improvement: balanced exploration
-                    sim_threshold = 0.65
-                    n_per_base = 20
-                    n_seeds = 30
-                    synthon_ratio = 0.70
-                    bt.logging.info(f"[V8] Moderate improvement ({score_improvement_rate:.4f}), medium similarity (0.65)")
-                
-                else:
-                    # Low/no improvement - PROVEN MULTI-RANGE STRATEGY (from vs_opponent/v7)
-                    bt.logging.info(f"[V8] Low improvement ({score_improvement_rate:.4f}), using PROVEN MULTI-RANGE strategy")
-                    
-                    # SMART: Adjust strategy based on absolute score and time
-                    if has_very_high_score or is_very_late_stage:
-                        # When we have very high scores, add focused exploitation on TOP 1
-                        # Part 1: Ultra-tight on TOP 1 molecule (30% of synthon budget)
-                        n_synthon_top1 = int(n_samples * 0.21)  # 30% of 70%
-                        synthon_top1_df = generate_molecules_from_synthon_library(
-                            synthon_lib,
-                            top_pool.head(1),  # TOP 1 ONLY
-                            n_synthon_top1,
-                            min_similarity=0.85,  # Very tight
-                            n_per_base=50
-                        )
-                        bt.logging.info(f"[V8] Generated {len(synthon_top1_df)} TOP-1 synthon candidates (sim=0.85)")
-                        
-                        # Part 2: Ultra-tight on top 5 molecules (10% of synthon budget)
-                        n_synthon_tight = int(n_samples * 0.07)  # 10% of 70%
-                        synthon_tight_df = generate_molecules_from_synthon_library(
-                            synthon_lib,
-                            top_pool.head(5),
-                            n_synthon_tight,
-                            min_similarity=0.80,  # Tight
-                            n_per_base=30
-                        )
-                        bt.logging.info(f"[V8] Generated {len(synthon_tight_df)} TIGHT synthon candidates (sim=0.80)")
-                        
-                        # Part 3: Medium on molecules 10-40 (30% of synthon budget)
-                        n_synthon_medium = int(n_samples * 0.21)  # 30% of 70%
-                        seed_medium = top_pool.iloc[10:40] if len(top_pool) > 40 else top_pool.iloc[5:]
-                        synthon_medium_df = generate_molecules_from_synthon_library(
-                            synthon_lib,
-                            seed_medium,
-                            n_synthon_medium,
-                            min_similarity=0.55,  # Medium - like richard1220v3
-                            n_per_base=15
-                        )
-                        bt.logging.info(f"[V8] Generated {len(synthon_medium_df)} MEDIUM synthon candidates (sim=0.55)")
-                        
-                        # Part 4: Broad on top 50 (30% of synthon budget)
-                        n_synthon_broad = int(n_samples * 0.21)  # 30% of 70%
-                        synthon_broad_df = generate_molecules_from_synthon_library(
-                            synthon_lib,
-                            top_pool.head(50),
-                            n_synthon_broad,
-                            min_similarity=0.40,  # Broad - like richard1220v3
-                            n_per_base=20
-                        )
-                        bt.logging.info(f"[V8] Generated {len(synthon_broad_df)} BROAD synthon candidates (sim=0.40)")
-                        
-                        # Combine all synthon approaches
-                        synthon_df = pd.concat([synthon_top1_df, synthon_tight_df, synthon_medium_df, synthon_broad_df], ignore_index=True)
-                    else:
-                        # Standard: PROVEN multi-range strategy from richard1220v3
-                        # Part 1: Ultra-tight on top 5 molecules (40% of synthon budget)
-                        n_synthon_tight = int(n_samples * 0.28)  # 40% of 70%
-                        synthon_tight_df = generate_molecules_from_synthon_library(
-                            synthon_lib,
-                            top_pool.head(5),
-                            n_synthon_tight,
-                            min_similarity=0.80,  # Very tight!
-                            n_per_base=30
-                        )
-                        bt.logging.info(f"[V8] Generated {len(synthon_tight_df)} TIGHT synthon candidates (sim=0.80)")
-                        
-                        # Part 2: Medium on molecules 10-40 (30% of synthon budget)
-                        n_synthon_medium = int(n_samples * 0.21)  # 30% of 70%
-                        seed_medium = top_pool.iloc[10:40] if len(top_pool) > 40 else top_pool.iloc[5:]
-                        synthon_medium_df = generate_molecules_from_synthon_library(
-                            synthon_lib,
-                            seed_medium,
-                            n_synthon_medium,
-                            min_similarity=0.55,  # Medium - like richard1220v3
-                            n_per_base=15
-                        )
-                        bt.logging.info(f"[V8] Generated {len(synthon_medium_df)} MEDIUM synthon candidates (sim=0.55)")
-                        
-                        # Part 3: Broad on top 50 (30% of synthon budget)
-                        n_synthon_broad = int(n_samples * 0.21)  # 30% of 70%
-                        synthon_broad_df = generate_molecules_from_synthon_library(
-                            synthon_lib,
-                            top_pool.head(50),
-                            n_synthon_broad,
-                            min_similarity=0.40,  # Broad - like richard1220v3
-                            n_per_base=20
-                        )
-                        bt.logging.info(f"[V8] Generated {len(synthon_broad_df)} BROAD synthon candidates (sim=0.40)")
-                        
-                        # Combine all synthon approaches
-                        synthon_df = pd.concat([synthon_tight_df, synthon_medium_df, synthon_broad_df], ignore_index=True)
-                    
-                    synthon_df = synthon_df.drop_duplicates(subset=["name"], keep="first")
-                    
-                    if not synthon_df.empty:
-                        synthon_df = validate_molecules(synthon_df, config)
-                        bt.logging.info(f"[V8] {len(synthon_df)} multi-range synthon candidates passed validation")
-                    
-                    # Generate remaining from GA with component weighting
-                    n_traditional = n_samples - len(synthon_df)
-                    if n_traditional > 0:
-                        traditional_df = generate_valid_random_molecules_batch(
-                            rxn_id,
-                            n_samples=n_traditional,
-                            db_path=DB_PATH,
-                            subnet_config=config,
-                            batch_size=400,
-                            elite_names=elite_names,
-                            elite_frac=elite_frac,
-                            mutation_prob=mutation_prob,
-                            avoid_inchikeys=seen_inchikeys,
-                            component_weights=component_weights,
-                        )
-                    else:
-                        traditional_df = pd.DataFrame(columns=["name", "smiles", "InChIKey"])
-                    
-                    data = pd.concat([synthon_df, traditional_df], ignore_index=True)
-                    data = data.drop_duplicates(subset=["name"], keep="first")
-                    bt.logging.info(f"[V8] Combined: {len(data)} total ({len(synthon_df)} multi-range synthon + {len(traditional_df)} GA)")
-                    
-                    # Skip the standard synthon generation below
-                    synthon_df = None
-                
-                # Standard single-range synthon generation (for high/medium improvement)
-                if score_improvement_rate > 0.005:  # Only if not using multi-range
-                    n_synthon = int(n_samples * synthon_ratio)
-                    synthon_gen_start = time.time()
-                    synthon_df = generate_molecules_from_synthon_library(
-                        synthon_lib,
-                        top_pool.head(n_seeds),
-                        n_synthon,
-                        min_similarity=sim_threshold,
-                        n_per_base=n_per_base
-                    )
-                    bt.logging.info(f"[V8] Generated {len(synthon_df)} synthon candidates in {time.time() - synthon_gen_start:.2f}s")
-                    
-                    # Generate remaining from traditional method
-                    n_traditional = n_samples - len(synthon_df)
-                    if n_traditional > 0:
-                        traditional_df = generate_valid_random_molecules_batch(
-                            rxn_id,
-                            n_samples=n_traditional,
-                            db_path=DB_PATH,
-                            subnet_config=config,
-                            batch_size=300,
-                            elite_names=elite_names,
-                            elite_frac=elite_frac,
-                            mutation_prob=mutation_prob,
-                            avoid_inchikeys=seen_inchikeys,
-                            component_weights=component_weights,
-                        )
-                    else:
-                        traditional_df = pd.DataFrame(columns=["name", "smiles", "InChIKey"])
-                    
-                    # Validate and combine
-                    if not synthon_df.empty:
-                        synthon_df = validate_molecules(synthon_df, config)
-                        bt.logging.info(f"[V8] {len(synthon_df)} synthon candidates passed validation")
-                    
-                    data = pd.concat([synthon_df, traditional_df], ignore_index=True)
-                    data = data.drop_duplicates(subset=["name"], keep="first")
-                    bt.logging.info(f"[V8] Combined: {len(data)} total ({len(synthon_df)} synthon + {len(traditional_df)} GA)")
-            
-            elif no_improvement_counter < 3:
-                bt.logging.info(f"[V8] Iteration {iteration}: Standard genetic algorithm")
-                data = generate_valid_random_molecules_batch(
-                    rxn_id,
-                    n_samples=n_samples,
-                    db_path=DB_PATH,
-                    subnet_config=config,
-                    batch_size=400,
-                    elite_names=elite_names,
-                    elite_frac=elite_frac,
-                    mutation_prob=mutation_prob,
-                    avoid_inchikeys=seen_inchikeys,
-                    component_weights=component_weights,
-                )
-            
-            elif no_improvement_counter < 6:
-                bt.logging.info(f"[V8] Iteration {iteration}: Exploring similar space (no_improvement={no_improvement_counter})")
-                data = _cpu_random_candidates_with_similarity(
-                    iteration,
-                    30,
-                    config,
-                    top_pool.head(50)[["name", "smiles", "InChIKey"]],
-                    seen_inchikeys,
-                    0.65
-                )
-                seed_df = pd.DataFrame(columns=["name", "smiles", "InChIKey", "tanimoto_similarity"])
-            
-            else:
-                bt.logging.info(f"[V8] Iteration {iteration}: Broad exploration reset (no_improvement={no_improvement_counter})")
-                data = _cpu_random_candidates_with_similarity(
-                    iteration,
-                    40,
-                    config,
-                    top_pool.head(100)[["name", "smiles", "InChIKey"]],
-                    seen_inchikeys,
-                    0.0
-                )
-                seed_df = pd.DataFrame(columns=["name", "smiles", "InChIKey", "tanimoto_similarity"])
-                no_improvement_counter = 0
-            
-            gen_time = time.time() - iter_start_time
-            bt.logging.info(f"[V8] Iteration {iteration}: {len(data)} Samples Generated in ~{gen_time:.2f}s (pre-score)")
+    df = df.drop_duplicates(subset=["InChIKey"], keep="first")
 
-            if data.empty:
-                bt.logging.warning(f"[V8] Iteration {iteration}: No valid molecules produced; continuing")
-                continue
-            
-            if not seed_df.empty:
-                data = pd.concat([data, seed_df])
-                data = data.drop_duplicates(subset=["InChIKey"], keep="first")
-                seed_df = pd.DataFrame(columns=["name", "smiles", "InChIKey", "tanimoto_similarity"])
+    if avoid_inchikeys:
+        df = df[~df["InChIKey"].isin(avoid_inchikeys)]
 
+    return df[["name", "smiles", "InChIKey"]].copy()
+
+
+
+def validate_molecules(data: pd.DataFrame, config: dict) -> pd.DataFrame:
+    """
+    Validate molecules by checking heavy atom count and rotatable bonds.
+    Returns DataFrame with validated molecules and their descriptors.
+    Defer InChIKey generation until after validation to avoid waste.
+    """
+    if data.empty:
+        return data
+    
+    data = data.copy()
+    data['smiles'] = data["name"].apply(_get_smiles_from_reaction_cached)
+    
+    data = data[data['smiles'].notna()]
+    if data.empty:
+        return data
+    
+    data['heavy_atoms'] = data["smiles"].apply(get_heavy_atom_count)
+    data['bonds'] = data["smiles"].apply(num_rotatable_bonds)
+    
+    mask = (
+        (data['heavy_atoms'] >= config['min_heavy_atoms']) &
+        (data['bonds'] >= config['min_rotatable_bonds']) &
+        (data['bonds'] <= config['max_rotatable_bonds'])
+    )
+    data = data[mask]
+    
+    if not data.empty:
+        data['InChIKey'] = data["smiles"].apply(generate_inchikey)
+    
+    return data
+
+
+@lru_cache(maxsize=None)
+def get_molecules_by_role(role_mask: int, db_path: str) -> List[Tuple[int, str, int]]:
+    try:
+        abs_db_path = os.path.abspath(db_path)
+        with sqlite3.connect(f"file:{abs_db_path}?mode=ro&immutable=1", uri=True) as conn:
+            conn.execute("PRAGMA query_only = ON")
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT mol_id, smiles, role_mask FROM molecules WHERE (role_mask & ?) = ?", 
+                (role_mask, role_mask)
+            )
+            results = cursor.fetchall()
+        return results
+    except Exception as e:
+        bt.logging.error(f"Error getting molecules by role {role_mask}: {e}")
+        return []
+
+
+class SynthonLibrary:
+    """Manages synthon-based similarity search for component selection using Morgan fingerprints."""
+    
+    def __init__(self, db_path: str, rxn_id: int):
+        self.db_path = db_path
+        self.rxn_id = rxn_id
+        self.reaction_info = get_reaction_info(rxn_id, db_path)
+        
+        if not self.reaction_info:
+            raise ValueError(f"Could not load reaction {rxn_id}")
+        
+        self.smarts, self.roleA, self.roleB, self.roleC = self.reaction_info
+        self.is_three_component = self.roleC is not None and self.roleC != 0
+        
+        # Load all components
+        self.molecules_A = get_molecules_by_role(self.roleA, db_path)
+        self.molecules_B = get_molecules_by_role(self.roleB, db_path)
+        self.molecules_C = get_molecules_by_role(self.roleC, db_path) if self.is_three_component else []
+        
+        # Build fingerprint indices
+        self.fps_A = self._build_fingerprint_index(self.molecules_A)
+        self.fps_B = self._build_fingerprint_index(self.molecules_B)
+        self.fps_C = self._build_fingerprint_index(self.molecules_C) if self.is_three_component else {}
+        
+        bt.logging.info(f"SynthonLibrary initialized: {len(self.fps_A)} A components, "
+                       f"{len(self.fps_B)} B components" + 
+                       (f", {len(self.fps_C)} C components" if self.is_three_component else ""))
+    
+    def _build_fingerprint_index(self, molecules: List[Tuple[int, str, int]]) -> Dict[int, object]:
+        """Build fingerprint index for fast similarity search."""
+        fps = {}
+        for mol_id, smiles, _ in molecules:
+            mol = _mol_from_smiles_cached(smiles)
+            if mol:
+                # Use MorganGenerator instead of deprecated method
+                fp = MORGAN_FP_GENERATOR.GetFingerprint(mol)
+                fps[mol_id] = fp
+        return fps
+    
+    def find_similar_components(
+        self, 
+        target_smiles: str, 
+        role: str = 'A',
+        top_k: int = 80,  # BALANCED: Find good number of similar components
+        min_similarity: float = 0.5
+    ) -> List[Tuple[int, float]]:
+        """
+        Find components similar to target molecule.
+        
+        Args:
+            target_smiles: SMILES string of target molecule
+            role: 'A', 'B', or 'C' - which component pool to search
+            top_k: Number of similar components to return
+            min_similarity: Minimum Tanimoto similarity threshold
+            
+        Returns:
+            List of (component_id, similarity_score) tuples
+        """
+        target_mol = _mol_from_smiles_cached(target_smiles)
+        if not target_mol:
+            return []
+        
+        # Use MorganGenerator instead of deprecated method
+        target_fp = MORGAN_FP_GENERATOR.GetFingerprint(target_mol)
+        
+        # Select appropriate fingerprint index
+        if role == 'A':
+            fps_dict = self.fps_A
+        elif role == 'B':
+            fps_dict = self.fps_B
+        elif role == 'C' and self.is_three_component:
+            fps_dict = self.fps_C
+        else:
+            return []
+        
+        # Calculate similarities - MORE AGGRESSIVE: check all components
+        similarities = []
+        for mol_id, fp in fps_dict.items():
             try:
-                filterd_data = data[~data["InChIKey"].isin(seen_inchikeys)]
-                if len(filterd_data) < len(data):
-                    bt.logging.warning(
-                        f"[V8] Iteration {iteration}: {len(data) - len(filterd_data)} molecules were previously seen"
-                    )
-
-                dup_ratio = (len(data) - len(filterd_data)) / max(1, len(data))
-                
-                if dup_ratio > 0.7:
-                    mutation_prob = min(0.9, mutation_prob * 1.5)
-                    elite_frac = max(0.15, elite_frac * 0.7)
-                    bt.logging.warning(f"[V8] SEVERE duplication ({dup_ratio:.2%})! mut={mutation_prob:.2f}, elite={elite_frac:.2f}")
-                elif dup_ratio > 0.5:
-                    mutation_prob = min(0.7, mutation_prob * 1.3)
-                    elite_frac = max(0.2, elite_frac * 0.8)
-                    bt.logging.warning(f"[V8] High duplication ({dup_ratio:.2%}), mut={mutation_prob:.2f}, elite={elite_frac:.2f}")
-                elif dup_ratio < 0.15 and not top_pool.empty and iteration > 10:
-                    mutation_prob = max(0.05, mutation_prob * 0.95)
-                    elite_frac = min(0.85, elite_frac * 1.05)
-
-                data = filterd_data
-
-            except Exception as e:
-                bt.logging.warning(f"[V8] Pre-score deduplication failed: {e}")
-
-            if data.empty:
-                bt.logging.error(f"[V8] Iteration {iteration}: ALL molecules were duplicates! Skipping scoring and continuing...")
-                # Force more diversity for next iteration
-                mutation_prob = min(0.95, mutation_prob * 2.0)
-                elite_frac = max(0.1, elite_frac * 0.5)
-                bt.logging.warning(f"[V8] Emergency diversity boost: mut={mutation_prob:.2f}, elite={elite_frac:.2f}")
-                continue  # Skip to next iteration
-
-            data = data.reset_index(drop=True)
-
-            # Enhanced CPU similarity search - multiple parallel searches (from v5/vs_opponent)
-            # Early start: iteration > 1 (from v5)
-            cpu_futures = []
-            if not top_pool.empty and iteration > 1:  # Early start from v5
-                # Multiple parallel CPU searches with different strategies
-                if score_improvement_rate < 0.01:
-                    # Strategy 1: Tight on top 5
-                    cpu_futures.append((
-                        cpu_executor.submit(
-                            _cpu_random_candidates_with_similarity,
-                            iteration,
-                            50,  # Increased from v5
-                            config,
-                            top_pool.head(5)[["name", "smiles", "InChIKey"]],
-                            seen_inchikeys,
-                            0.82  # Slightly higher threshold
-                        ),
-                        "tight-top5"
-                    ))
-                    
-                    # Strategy 2: Medium on top 15 (from v5)
-                    cpu_futures.append((
-                        cpu_executor.submit(
-                            _cpu_random_candidates_with_similarity,
-                            iteration,
-                            40,
-                            config,
-                            top_pool.head(15)[["name", "smiles", "InChIKey"]],
-                            seen_inchikeys,
-                            0.70
-                        ),
-                        "medium-top15"
-                    ))
-                    
-                    # Strategy 3: Broad on top 30 (from v5)
-                    cpu_futures.append((
-                        cpu_executor.submit(
-                            _cpu_random_candidates_with_similarity,
-                            iteration,
-                            30,
-                            config,
-                            top_pool.head(30)[["name", "smiles", "InChIKey"]],
-                            seen_inchikeys,
-                            0.55
-                        ),
-                        "broad-top30"
-                    ))
-            
-            gpu_start_time = time.time()
-
-            if len(data) == 0:
-                bt.logging.error(f"[V8] Iteration {iteration}: No molecules to score! Continuing...")
+                sim = DataStructs.TanimotoSimilarity(target_fp, fp)
+                if sim >= min_similarity:
+                    similarities.append((mol_id, sim))
+            except Exception:
                 continue
-
-            data["Target"] = target_score_from_data(data["smiles"])
-            data["Anti"] = antitarget_scores()
-            data["score"] = data["Target"] - (config["antitarget_weight"] * data["Anti"])
-
-            if data["score"].isna().all():
-                bt.logging.error(f"[V8] Iteration {iteration}: Scoring failed (all NaN)! Continuing...")
+        
+        # Sort by similarity and return top_k
+        similarities.sort(key=lambda x: x[1], reverse=True)
+        return similarities[:top_k]
+        
+    def find_similar_to_molecule_name(
+        self,
+        molecule_name: str,
+        vary_component: str = 'both',
+        top_k_per_component: int = 10,
+        min_similarity: float = 0.6
+    ) -> Dict[str, List[int]]:
+        """
+        Given a high-scoring molecule name, find similar components.
+        
+        Args:
+            molecule_name: e.g., "rxn:1:123:456" or "rxn:3:123:456:789"
+            vary_component: 'A', 'B', 'C', 'both', or 'all'
+            top_k_per_component: How many similar components to find per role
+            min_similarity: Minimum similarity threshold
+            
+        Returns:
+            Dict with keys 'A', 'B', 'C' containing lists of similar component IDs
+        """
+        # Parse molecule name
+        parts = molecule_name.split(":")
+        if len(parts) < 4:
+            return {}
+        
+        try:
+            if len(parts) == 4:
+                _, rxn, A_id, B_id = parts
+                A_id, B_id = int(A_id), int(B_id)
+                C_id = None
+            else:
+                _, rxn, A_id, B_id, C_id = parts
+                A_id, B_id, C_id = int(A_id), int(B_id), int(C_id)
+        except (ValueError, IndexError):
+            return {}
+        
+        # Get SMILES for each component
+        result = {}
+        
+        if vary_component in ['A', 'both', 'all']:
+            A_smiles = self._get_component_smiles(A_id, 'A')
+            if A_smiles:
+                similar_As = self.find_similar_components(
+                    A_smiles, 'A', top_k_per_component, min_similarity
+                )
+                result['A'] = [mol_id for mol_id, _ in similar_As if mol_id != A_id]
+        
+        if vary_component in ['B', 'both', 'all']:
+            B_smiles = self._get_component_smiles(B_id, 'B')
+            if B_smiles:
+                similar_Bs = self.find_similar_components(
+                    B_smiles, 'B', top_k_per_component, min_similarity
+                )
+                result['B'] = [mol_id for mol_id, _ in similar_Bs if mol_id != B_id]
+        
+        if self.is_three_component and C_id and vary_component in ['C', 'all']:
+            C_smiles = self._get_component_smiles(C_id, 'C')
+            if C_smiles:
+                similar_Cs = self.find_similar_components(
+                    C_smiles, 'C', top_k_per_component, min_similarity
+                )
+                result['C'] = [mol_id for mol_id, _ in similar_Cs if mol_id != C_id]
+        
+        return result
+    
+    def _get_component_smiles(self, mol_id: int, role: str) -> str:
+        """Get SMILES for a component by ID and role."""
+        if role == 'A':
+            molecules = self.molecules_A
+        elif role == 'B':
+            molecules = self.molecules_B
+        elif role == 'C':
+            molecules = self.molecules_C
+        else:
+            return None
+        
+        for mid, smiles, _ in molecules:
+            if mid == mol_id:
+                return smiles
+        return None
+    
+    def generate_similar_molecules(
+        self,
+        base_molecule_names: List[str],
+        n_per_base: int = 5,
+        min_similarity: float = 0.6
+    ) -> List[str]:
+        """
+        Generate new molecule names by finding similar components to base molecules.
+        ULTIMATE PERFECTED: Maximum variations for top molecules.
+        
+        Args:
+            base_molecule_names: List of high-scoring molecule names
+            n_per_base: How many variations to generate per base molecule
+            min_similarity: Minimum component similarity threshold
+            
+        Returns:
+            List of new molecule names to try
+        """
+        new_molecules = []
+        
+        # SUPER-AGGRESSIVE: When only one base molecule, MAXIMUM variations
+        is_single_molecule = len(base_molecule_names) == 1
+        # For single molecule with high n_per_base, use as-is; otherwise boost significantly
+        if is_single_molecule:
+            if n_per_base >= 80:
+                effective_n_per_base = n_per_base  # Already maximum
+            else:
+                effective_n_per_base = n_per_base * 3  # 3x multiplier for single top molecule - BALANCED
+        else:
+            effective_n_per_base = n_per_base
+        
+        for base_name in base_molecule_names:
+            parts = base_name.split(":")
+            if len(parts) < 4:
                 continue
             
-            gpu_time = time.time() - gpu_start_time
-            bt.logging.info(f"[V8] Iteration {iteration}: GPU scoring time ~{gpu_time:.2f}s")
-            
-            # Collect all CPU results
-            if cpu_futures:
-                for cpu_future, strategy_name in cpu_futures:
-                    try:
-                        cpu_df = cpu_future.result(timeout=0)
-                        if not cpu_df.empty:
-                            if seed_df.empty:
-                                seed_df = cpu_df.copy()
-                            else:
-                                seed_df = pd.concat([seed_df, cpu_df], ignore_index=True)
-                            bt.logging.info(f"[V8] CPU similarity ({strategy_name}) found {len(cpu_df)} candidates")
-                    except TimeoutError:
-                        pass
-                    except Exception as e:
-                        bt.logging.warning(f"[V8] CPU similarity ({strategy_name}) failed: {e}")
-                
-                if not seed_df.empty:
-                    seed_df = seed_df.drop_duplicates(subset=["InChIKey"], keep="first")
-            
-            seen_inchikeys.update([k for k in data["InChIKey"].tolist() if k])
-            total_data = data[["name", "smiles", "InChIKey", "score", "Target", "Anti"]]
-            prev_avg_score = top_pool['score'].mean() if not top_pool.empty else None
-
-            # Safe concatenation
-            if not total_data.empty:
-                top_pool = pd.concat([top_pool, total_data], ignore_index=True)
-                top_pool = top_pool.drop_duplicates(subset=["InChIKey"], keep="first")
-                top_pool = top_pool.sort_values(by="score", ascending=False)
-            else:
-                bt.logging.warning(f"[V8] Iteration {iteration}: No valid scored data to add to pool")
-
-            # PERIODIC ENTROPY CHECK (from v7) - every 5 iterations
-            if iteration % 5 == 0 and not top_pool.empty:
-                try:
-                    current_entropy = compute_maccs_entropy(
-                        top_pool.head(config["num_molecules"])['smiles'].to_list()
-                    )
-                    bt.logging.info(f"[V8] Periodic entropy check: {current_entropy:.4f}")
+            try:
+                if len(parts) == 4:
+                    _, rxn, A_id, B_id = parts
+                    A_id, B_id = int(A_id), int(B_id)
                     
-                    if current_entropy < config['entropy_min_threshold'] * 1.2:
-                        mutation_prob = min(0.8, mutation_prob * 1.3)
-                        elite_frac = max(0.3, elite_frac * 0.8)
-                        bt.logging.warning(f"[V8] Low entropy detected, boosting diversity: mut={mutation_prob:.2f}, elite={elite_frac:.2f}")
-                except Exception as e:
-                    bt.logging.warning(f"[V8] Entropy check failed: {e}")
+                    # Find similar components - PERFECTED: find more for single molecule
+                    similar_comps = self.find_similar_to_molecule_name(
+                        base_name, 'both', effective_n_per_base, min_similarity
+                    )
+                    
+                    # Generate variations by replacing A
+                    for new_A in similar_comps.get('A', [])[:effective_n_per_base]:
+                        new_molecules.append(f"rxn:{rxn}:{new_A}:{B_id}")
+                    
+                    # Generate variations by replacing B
+                    for new_B in similar_comps.get('B', [])[:effective_n_per_base]:
+                        new_molecules.append(f"rxn:{rxn}:{A_id}:{new_B}")
                 
-                # Track best molecules for later intensive exploration
-                best_molecules_history.append({
-                    'iteration': iteration,
-                    'molecules': top_pool.head(10)[["name", "smiles", "InChIKey", "score"]].copy()
-                })
-                if len(best_molecules_history) > 6:
-                    best_molecules_history.pop(0)
-
-            remaining_time = 1800 - (time.time() - start)
-            if remaining_time <= 60:
-                entropy = compute_maccs_entropy(top_pool.iloc[:config["num_molecules"]]['smiles'].to_list())
-                if entropy > config['entropy_min_threshold']:
-                    top_pool = top_pool.head(config["num_molecules"])
-                    bt.logging.info(f"[V8] Iteration {iteration}: Sufficient Entropy = {entropy:.4f}")
-                else:
-                    try:
-                        top_95 = top_pool.iloc[:95]
-                        remaining_pool = top_pool.iloc[95:]
-                        additional_5 = select_diverse_subset(remaining_pool, top_95["smiles"].tolist(), 
-                                                            subset_size=5, entropy_threshold=config['entropy_min_threshold'])
-                        if not additional_5.empty:
-                            top_pool = pd.concat([top_95, additional_5]).reset_index(drop=True)
-                            entropy = compute_maccs_entropy(top_pool['smiles'].to_list())
-                            bt.logging.info(f"[V8] Iteration {iteration}: Adjusted Entropy = {entropy:.4f}")
-                        else:
-                            top_pool = top_pool.head(config["num_molecules"])
-                    except Exception as e:
-                        bt.logging.warning(f"[V8] Entropy handling failed: {e}")
-            else:
-                top_pool = top_pool.head(config["num_molecules"])
+                else:  # 3-component
+                    _, rxn, A_id, B_id, C_id = parts
+                    A_id, B_id, C_id = int(A_id), int(B_id), int(C_id)
+                    
+                    similar_comps = self.find_similar_to_molecule_name(
+                        base_name, 'all', effective_n_per_base, min_similarity
+                    )
+                    
+                    # Generate variations
+                    for new_A in similar_comps.get('A', [])[:effective_n_per_base]:
+                        new_molecules.append(f"rxn:{rxn}:{new_A}:{B_id}:{C_id}")
+                    
+                    for new_B in similar_comps.get('B', [])[:effective_n_per_base]:
+                        new_molecules.append(f"rxn:{rxn}:{A_id}:{new_B}:{C_id}")
+                    
+                    for new_C in similar_comps.get('C', [])[:effective_n_per_base]:
+                        new_molecules.append(f"rxn:{rxn}:{A_id}:{B_id}:{new_C}")
             
-            current_avg_score = top_pool['score'].mean() if not top_pool.empty else None
+            except (ValueError, IndexError) as e:
+                bt.logging.warning(f"Could not parse molecule name {base_name}: {e}")
+                continue
+        
+        # Remove duplicates while preserving order
+        return list(dict.fromkeys(new_molecules))
 
-            if current_avg_score is not None:
-                if prev_avg_score is not None:
-                    score_improvement_rate = (current_avg_score - prev_avg_score) / max(abs(prev_avg_score), 1e-6)
-                prev_avg_score = current_avg_score
 
-            if score_improvement_rate == 0.0:
-                no_improvement_counter += 1
-            else:
-                no_improvement_counter = 0
-            
-            iter_total_time = time.time() - iter_start_time
-            top_entries = {"molecules": top_pool["name"].tolist()}
-            total_time = time.time() - start
-            
-            bt.logging.info(
-                f"[V8] Iteration {iteration} || Time: {iter_total_time:.2f}s | Total: {total_time:.2f}s | "
-                f"Avg: {top_pool['score'].mean():.4f} | Max: {top_pool['score'].max():.4f} | "
-                f"Min: {top_pool['score'].min():.4f} | Elite: {elite_frac:.2f} | "
-                f"Mut: {mutation_prob:.2f} | Improve: {score_improvement_rate:.4f}"
+def generate_molecules_from_synthon_library(
+    synthon_lib: SynthonLibrary,
+    top_molecules: pd.DataFrame,
+    n_samples: int,
+    min_similarity: float = 0.6,
+    n_per_base: int = 10
+) -> pd.DataFrame:
+    """
+    Generate new molecules using synthon similarity search.
+    ULTIMATE PERFECTED: Maximum exploitation of top molecules.
+    
+    Args:
+        synthon_lib: Initialized SynthonLibrary
+        top_molecules: DataFrame with top-scoring molecules
+        n_samples: Target number of molecules to generate
+        min_similarity: Minimum component similarity
+        n_per_base: Variations per base molecule
+        
+    Returns:
+        DataFrame with new molecule names
+    """
+    if top_molecules.empty:
+        return pd.DataFrame(columns=["name"])
+    
+    # SUPER-AGGRESSIVE: When only 1 molecule, MAXIMUM exploitation
+    if len(top_molecules) == 1:
+        # Single molecule: generate MAXIMUM variations
+        seed_names = top_molecules["name"].tolist()
+        # SUPER-AGGRESSIVE: For single top molecule, use 4x variations if n_per_base is high
+        if n_per_base >= 80:
+            effective_n_per_base = n_per_base  # Already high, use as-is
+        else:
+            effective_n_per_base = n_per_base * 4  # 4x multiplier for single molecule - SUPER-AGGRESSIVE
+    else:
+        # Multiple molecules: use appropriate number
+        n_seeds = min(30, len(top_molecules))  # More seeds like model1
+        seed_names = top_molecules.head(n_seeds)["name"].tolist()
+        effective_n_per_base = n_per_base
+    
+    # Generate similar molecules
+    new_names = synthon_lib.generate_similar_molecules(
+        seed_names,
+        n_per_base=effective_n_per_base,
+        min_similarity=min_similarity
+    )
+    
+    if not new_names:
+        return pd.DataFrame(columns=["name"])
+    
+    # SUPER-AGGRESSIVE: Keep all high-quality variations, only sample if excessive
+    if len(new_names) > n_samples * 3.0:  # Allow more overflow
+        new_names = random.sample(new_names, int(n_samples * 2.0))  # Keep more
+    
+    return pd.DataFrame({"name": new_names})
+
+
+def generate_valid_random_molecules_batch(
+    rxn_id: int,
+    n_samples: int,
+    db_path: str,
+    subnet_config: dict,
+    batch_size: int = 200,
+    seed: int = None,
+    elite_names: list[str] | None = None,
+    elite_frac: float = 0.5,
+    mutation_prob: float = 0.1,
+    avoid_inchikeys: set[str] | None = None,
+    component_weights: dict | None = None,
+) -> pd.DataFrame:
+    reaction_info = get_reaction_info(rxn_id, db_path)
+    if not reaction_info:
+        bt.logging.error(f"Could not get reaction info for rxn_id {rxn_id}")
+        return pd.DataFrame(columns=["name", "smiles", "InChIKey"])
+    
+    smarts, roleA, roleB, roleC = reaction_info
+    is_three_component = roleC is not None and roleC != 0
+    
+    molecules_A = get_molecules_by_role(roleA, db_path)
+    molecules_B = get_molecules_by_role(roleB, db_path)
+    molecules_C = get_molecules_by_role(roleC, db_path) if is_three_component else []
+
+    if not molecules_A or not molecules_B or (is_three_component and not molecules_C):
+        bt.logging.error(f"No molecules found for roles A={roleA}, B={roleB}, C={roleC}")
+        return pd.DataFrame(columns=["name", "smiles", "InChIKey"])
+
+    elite_As, elite_Bs, elite_Cs = set(), set(), set()
+    if elite_names:
+        for name in elite_names:
+            A, B, C = _parse_components(name)
+            if A is not None: 
+                elite_As.add(A)
+            if B is not None: 
+                elite_Bs.add(B)
+            if C is not None and is_three_component: 
+                elite_Cs.add(C)
+
+    pool_A_ids = _ids_from_pool(molecules_A)
+    pool_B_ids = _ids_from_pool(molecules_B)
+    pool_C_ids = _ids_from_pool(molecules_C) if is_three_component else []
+    valid_dfs = []
+    seen_keys = set()
+    total_valid = 0
+    
+    while total_valid < n_samples:
+        needed = n_samples - total_valid
+        batch_size_actual = min(max(batch_size, 300), needed * 2)
+        
+        emitted_names = set()
+        if elite_names:
+            n_elite = max(0, min(batch_size_actual, int(batch_size_actual * elite_frac)))
+            n_rand = batch_size_actual - n_elite
+
+            elite_batch = generate_offspring_from_elites(
+                rxn_id=rxn_id,
+                n=n_elite,
+                pool_A_ids=pool_A_ids,
+                pool_B_ids=pool_B_ids,
+                pool_C_ids=pool_C_ids,
+                is_three_component=is_three_component,
+                mutation_prob=mutation_prob,
+                seed=seed,
+                avoid_names=emitted_names,
+                avoid_inchikeys=avoid_inchikeys,
+                max_tries=10,
+                elite_As=elite_As,
+                elite_Bs=elite_Bs,
+                elite_Cs=elite_Cs,
+            )
+            emitted_names.update(elite_batch)
+
+            rand_batch = generate_molecules_from_pools(
+                rxn_id, n_rand, molecules_A, molecules_B, molecules_C, is_three_component, seed, component_weights
+            )
+            rand_batch = [n for n in rand_batch if n and (n not in emitted_names)]
+            batch_molecules = elite_batch + rand_batch
+
+        else:
+            batch_molecules = generate_molecules_from_pools(
+                rxn_id, batch_size_actual, molecules_A, molecules_B, molecules_C, is_three_component, seed, component_weights
             )
 
-            with open(os.path.join(OUTPUT_DIR, "result.json"), "w") as f:
-                json.dump(top_entries, f, ensure_ascii=False, indent=2)
+        
+        if not batch_molecules:
+            continue
+            
+        batch_df = pd.DataFrame({"name": batch_molecules})
+        batch_df = batch_df[batch_df["name"].notna()]  # Remove None values
+        if batch_df.empty:
+            continue
+            
+        batch_df = validate_molecules(batch_df, subnet_config)
+        
+        if batch_df.empty:
+            continue
+
+        batch_df = batch_df.drop_duplicates(subset=["InChIKey"], keep="first")
+        
+        mask = ~batch_df["InChIKey"].isin(seen_keys)
+        if avoid_inchikeys:
+            mask = mask & ~batch_df["InChIKey"].isin(avoid_inchikeys)
+        batch_df = batch_df[mask]
+        
+        if batch_df.empty:
+            continue
+        
+        seen_keys.update(batch_df["InChIKey"].values)
+        valid_dfs.append(batch_df[["name", "smiles", "InChIKey"]].copy())
+        total_valid += len(batch_df)
+        
+        if total_valid >= n_samples:
+            break
+        
+    if not valid_dfs:
+        return pd.DataFrame(columns=["name", "smiles", "InChIKey"])
+    
+    # Concatenate all DataFrames at once
+    result_df = pd.concat(valid_dfs, ignore_index=True)
+    return result_df.head(n_samples).copy()
 
 
-if __name__ == "__main__":
-    config = get_config()
-    start_time_1 = time.time()
-    initialize_models(config)
-    bt.logging.info(f"{time.time() - start_time_1} seconds for model initialization")
-    main(config)
+def generate_molecules_from_pools(rxn_id: int, n: int, molecules_A: List[Tuple], molecules_B: List[Tuple], 
+                                molecules_C: List[Tuple], is_three_component: bool, seed: int = None,
+                                component_weights: dict = None) -> List[str]:
+    
+    rng = random.Random(seed) if seed is not None else random
+    
+    A_ids = [a[0] for a in molecules_A]
+    B_ids = [b[0] for b in molecules_B]
+    C_ids = [c[0] for c in molecules_C] if is_three_component else None
+    
+    # Use weighted sampling if component weights are provided
+    if component_weights:
+        # Build weights for each component pool
+        weights_A = [component_weights.get('A', {}).get(aid, 1.0) for aid in A_ids]
+        weights_B = [component_weights.get('B', {}).get(bid, 1.0) for bid in B_ids]
+        weights_C = [component_weights.get('C', {}).get(cid, 1.0) for cid in C_ids] if is_three_component else None
+        
+        # Normalize weights
+        if weights_A:
+            sum_w = sum(weights_A)
+            weights_A = [w / sum_w if sum_w > 0 else 1.0/len(weights_A) for w in weights_A]
+        if weights_B:
+            sum_w = sum(weights_B)
+            weights_B = [w / sum_w if sum_w > 0 else 1.0/len(weights_B) for w in weights_B]
+        if weights_C:
+            sum_w = sum(weights_C)
+            weights_C = [w / sum_w if sum_w > 0 else 1.0/len(weights_C) for w in weights_C]
+        
+        picks_A = rng.choices(A_ids, weights=weights_A, k=n) if weights_A else rng.choices(A_ids, k=n)
+        picks_B = rng.choices(B_ids, weights=weights_B, k=n) if weights_B else rng.choices(B_ids, k=n)
+        if is_three_component:
+            picks_C = rng.choices(C_ids, weights=weights_C, k=n) if weights_C else rng.choices(C_ids, k=n)
+            names = [f"rxn:{rxn_id}:{a}:{b}:{c}" for a, b, c in zip(picks_A, picks_B, picks_C)]
+        else:
+            names = [f"rxn:{rxn_id}:{a}:{b}" for a, b in zip(picks_A, picks_B)]
+    else:
+        # Uniform random sampling
+        picks_A = rng.choices(A_ids, k=n)
+        picks_B = rng.choices(B_ids, k=n)
+        if is_three_component:
+            picks_C = rng.choices(C_ids, k=n)
+            names = [f"rxn:{rxn_id}:{a}:{b}:{c}" for a, b, c in zip(picks_A, picks_B, picks_C)]
+        else:
+            names = [f"rxn:{rxn_id}:{a}:{b}" for a, b in zip(picks_A, picks_B)]
+    
+    # Remove duplicates while preserving order
+    names = list(dict.fromkeys(names))
+    return names
+
+def _parse_components(name: str) -> tuple[int, int, int | None]:
+    # name format: "rxn:{rxn_id}:{A}:{B}" or "rxn:{rxn_id}:{A}:{B}:{C}"
+    parts = name.split(":")
+    if len(parts) < 4:
+        return None, None, None
+    A = int(parts[2]); B = int(parts[3])
+    C = int(parts[4]) if len(parts) > 4 else None
+    return A, B, C
+
+def _ids_from_pool(pool):
+    return [x[0] for x in pool]
+
+def generate_offspring_from_elites(rxn_id: int, n: int,
+                                   is_three_component: bool,
+                                   pool_A_ids:list,
+                                   pool_B_ids:list,
+                                   pool_C_ids:list,
+                                   mutation_prob: float = 0.1, seed: int | None = None,
+                                   avoid_names: set[str] = None,
+                                   avoid_inchikeys: set[str] = None,
+                                   max_tries: int = 10,
+                                   elite_As: set[int] = None,
+                                   elite_Bs: set[int] = None,
+                                   elite_Cs: set[int] = None) -> list[str]:
+    
+    rng = random.Random(seed) if seed is not None else random
+    
+    elite_As_list = list(elite_As) if elite_As else []
+    elite_Bs_list = list(elite_Bs) if elite_Bs else []
+    elite_Cs_list = list(elite_Cs) if elite_Cs else []
+
+    out = []
+    local_names = set()
+    check_inchikeys = avoid_inchikeys is not None and len(avoid_inchikeys) > 0
+    
+    for _ in range(n):
+        cand = None
+        name = None
+        for _try in range(max_tries):
+            use_mutA = (not elite_As) or (rng.random() < mutation_prob)
+            use_mutB = (not elite_Bs) or (rng.random() < mutation_prob)
+            use_mutC = (not elite_Cs) or (rng.random() < mutation_prob)
+
+            A = rng.choice(pool_A_ids) if use_mutA else rng.choice(elite_As_list)
+            B = rng.choice(pool_B_ids) if use_mutB else rng.choice(elite_Bs_list)
+            if is_three_component:
+                C = rng.choice(pool_C_ids) if use_mutC else rng.choice(elite_Cs_list)
+                name = f"rxn:{rxn_id}:{A}:{B}:{C}"
+            else:
+                name = f"rxn:{rxn_id}:{A}:{B}"
+
+            # Fast checks first (set membership is O(1))
+            if avoid_names and name in avoid_names:
+                continue
+            if name in local_names:
+                continue
+
+            if check_inchikeys:
+                try:
+                    key = _inchikey_from_name_cached(name)
+                    if key and key in avoid_inchikeys:
+                        continue
+                except Exception:
+                    pass
+
+            cand = name
+            break
+
+        if cand is None:
+            if name is None:
+                A = rng.choice(pool_A_ids)
+                B = rng.choice(pool_B_ids)
+                if is_three_component:
+                    C = rng.choice(pool_C_ids) if pool_C_ids else 0
+                    name = f"rxn:{rxn_id}:{A}:{B}:{C}"
+                else:
+                    name = f"rxn:{rxn_id}:{A}:{B}"
+            cand = name
+        out.append(cand)
+        local_names.add(cand)
+        if avoid_names is not None:
+            avoid_names.add(cand)
+    return out
+
+def select_diverse_elites(top_pool: pd.DataFrame, n_elites: int, min_score_ratio: float = 0.65) -> pd.DataFrame:
+    """
+    Select diverse elite molecules: top by score, but ensure diversity in component space.
+    ENHANCED: Lower threshold to include more candidates, better diversity.
+    """
+    if top_pool.empty or n_elites <= 0:
+        return pd.DataFrame()
+    
+    # Take MORE top candidates for better diversity selection
+    top_candidates = top_pool.head(min(len(top_pool), n_elites * 4))  # Increased from 3
+    if len(top_candidates) <= n_elites:
+        return top_candidates
+    
+    # Score threshold: LOWER threshold to include more candidates
+    max_score = top_candidates['score'].max()
+    threshold = max_score * min_score_ratio
+    candidates = top_candidates[top_candidates['score'] >= threshold]
+    
+    # Select diverse set: prefer molecules with different components
+    selected = []
+    used_components = {'A': set(), 'B': set(), 'C': set()}
+    
+    # First, add top scorer
+    if not candidates.empty:
+        top_idx = candidates.index[0]
+        top_row = candidates.iloc[0]
+        selected.append(top_idx)
+        parts = top_row['name'].split(":")
+        if len(parts) >= 4:
+            try:
+                used_components['A'].add(int(parts[2]))
+                used_components['B'].add(int(parts[3]))
+                if len(parts) > 4:
+                    used_components['C'].add(int(parts[4]))
+            except (ValueError, IndexError):
+                pass
+    
+    # Then add diverse molecules - MORE AGGRESSIVE diversity selection
+    for idx, row in candidates.iterrows():
+        if len(selected) >= n_elites:
+            break
+        if idx in selected:
+            continue
+        
+        parts = row['name'].split(":")
+        if len(parts) >= 4:
+            try:
+                A_id = int(parts[2])
+                B_id = int(parts[3])
+                C_id = int(parts[4]) if len(parts) > 4 else None
+                
+                # Prefer molecules with new components - MORE AGGRESSIVE
+                is_diverse = (A_id not in used_components['A'] or 
+                             B_id not in used_components['B'] or
+                             (C_id is not None and C_id not in used_components['C']))
+                
+                # Lower threshold for diversity - include more diverse molecules
+                if is_diverse or len(selected) < n_elites * 0.6:  # Increased from 0.5
+                    selected.append(idx)
+                    used_components['A'].add(A_id)
+                    used_components['B'].add(B_id)
+                    if C_id is not None:
+                        used_components['C'].add(C_id)
+            except (ValueError, IndexError):
+                if len(selected) < n_elites:
+                    selected.append(idx)
+    
+    # Fill remaining slots
+    for idx, row in candidates.iterrows():
+        if len(selected) >= n_elites:
+            break
+        if idx not in selected:
+            selected.append(idx)
+    
+    return candidates.loc[selected[:n_elites]] if selected else candidates.head(n_elites)
+
+
+def build_component_weights(top_pool: pd.DataFrame, rxn_id: int) -> Dict[str, Dict[int, float]]:
+    """
+    Build component weights based on scores of molecules containing them.
+    ENHANCED: Use exponential weighting for top molecules to emphasize best components.
+    Returns dict with 'A', 'B', 'C' keys mapping to {component_id: weight}
+    """
+    weights = {'A': defaultdict(float), 'B': defaultdict(float), 'C': defaultdict(float)}
+    counts = {'A': defaultdict(int), 'B': defaultdict(int), 'C': defaultdict(int)}
+    
+    if top_pool.empty:
+        return weights
+    
+    # Get max score for normalization
+    max_score = top_pool['score'].max() if not top_pool.empty else 1.0
+    
+    # Extract component IDs and scores with EXPONENTIAL weighting for top molecules
+    for idx, row in top_pool.iterrows():
+        name = row['name']
+        score = row['score']
+        
+        # BALANCED exponential weighting: top molecules contribute more but not excessively
+        # Rank-based exponential: rank 1 gets weight 2.5, rank 10 gets weight 1.2, etc.
+        rank = idx + 1
+        rank_weight = 2.5 * math.exp(-rank / 18.0)  # Balanced exponential decay
+        weighted_score = max(0, score) * rank_weight
+        
+        parts = name.split(":")
+        if len(parts) >= 4:
+            try:
+                A_id = int(parts[2])
+                B_id = int(parts[3])
+                weights['A'][A_id] += weighted_score
+                weights['B'][B_id] += weighted_score
+                counts['A'][A_id] += 1
+                counts['B'][B_id] += 1
+                
+                if len(parts) > 4:
+                    C_id = int(parts[4])
+                    weights['C'][C_id] += weighted_score
+                    counts['C'][C_id] += 1
+            except (ValueError, IndexError):
+                continue
+    
+    # Normalize by count and add smoothing - but preserve exponential weighting
+    for role in ['A', 'B', 'C']:
+        for comp_id in weights[role]:
+            if counts[role][comp_id] > 0:
+                # Average with exponential weighting preserved
+                avg_weight = weights[role][comp_id] / counts[role][comp_id]
+                # Add smoothing but keep the exponential boost
+                weights[role][comp_id] = avg_weight + 0.15  # Balanced smoothing
+    
+    return weights
 
