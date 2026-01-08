@@ -181,13 +181,13 @@ def main(config: dict):
     # - TOP-1 focused strategy (from v7/vs_opponent) - when scores are very high
     # - Early CPU search: iteration > 1 (from v5) - 3 strategies
     # - Better multi-range strategy (from v7/vs_opponent) - TOP-1, TOP-5, medium, broad
-    base_n_samples = 3000  # Higher exploration from v1/v4/v6/v7
+    base_n_samples = 1000  # Higher exploration from v1/v4/v6/v7
     top_pool = pd.DataFrame(columns=["name", "smiles", "InChIKey", "score", "Target", "Anti"])
     rxn_id = int(config["allowed_reaction"].split(":")[-1])
     iteration = 0
     
-    mutation_prob = 0.3
-    elite_frac = 0.6
+    mutation_prob = 0.5
+    elite_frac = 0.4
     
     seen_inchikeys = set()
     seed_df = pd.DataFrame(columns=["name", "smiles", "InChIKey", "tanimoto_similarity"])
@@ -208,7 +208,7 @@ def main(config: dict):
     n_samples_first_iteration = base_n_samples * 6 if config["allowed_reaction"] != "rxn:5" else base_n_samples * 3
 
     # Use 3 CPU workers for parallel exploration (from vs_opponent)
-    with ProcessPoolExecutor(max_workers=3) as cpu_executor:
+    with ProcessPoolExecutor(max_workers=2) as cpu_executor:
         while time.time() - start < 1800:
             iteration += 1
             iter_start_time = time.time()
