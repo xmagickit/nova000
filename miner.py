@@ -173,13 +173,13 @@ def select_diverse_subset(pool, top_95_smiles, subset_size=5, entropy_threshold=
 def main(config: dict):
     # WINNING MODEL: Combines best of richard1220v3 (balanced) + patarcom1 (exploration) + smart adaptations
     # Target: Beat richard1220v3 (0.0124) by 0.05+ to reach 0.0174+
-    base_n_samples = 512  # Optimized: proven pattern for high scores (more iterations, faster learning)
+    base_n_samples = 800  # Optimized: proven pattern for high scores (more iterations, faster learning)
     top_pool = pd.DataFrame(columns=["name", "smiles", "InChIKey", "score", "Target", "Anti"])
     rxn_id = int(config["allowed_reaction"].split(":")[-1])
     iteration = 0
     
-    mutation_prob = 0.5
-    elite_frac = 0.4
+    mutation_prob = 0.25
+    elite_frac = 0.75
     
     seen_inchikeys = set()
     seed_df = pd.DataFrame(columns=["name", "smiles", "InChIKey", "tanimoto_similarity"])
@@ -200,7 +200,7 @@ def main(config: dict):
     n_samples_first_iteration = base_n_samples * 4 if config["allowed_reaction"] != "rxn:5" else base_n_samples * 2
 
     # Use single CPU worker - proven pattern reduces overhead, improves stability
-    with ProcessPoolExecutor(max_workers=1) as cpu_executor:
+    with ProcessPoolExecutor(max_workers=2) as cpu_executor:
         while time.time() - start < 1800:
             iteration += 1
             iter_start_time = time.time()
