@@ -302,7 +302,7 @@ def main(config: dict):
                     if has_very_high_score or is_very_late_stage:
                         # When we have very high scores, add focused exploitation on TOP 1
                         # Part 1: Ultra-tight on TOP 1 molecule (30% of synthon budget) - OPTIMIZED for high scores
-                        n_synthon_top1 = int(n_samples * 0.4)  # Increased from 0.21 to 0.30 for maximum exploitation
+                        n_synthon_top1 = int(n_samples * 0.25)  # Increased from 0.21 to 0.30 for maximum exploitation
                         synthon_top1_df = generate_molecules_from_synthon_library(
                             synthon_lib,
                             top_pool.head(1),  # TOP 1 ONLY
